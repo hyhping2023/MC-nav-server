@@ -16,10 +16,31 @@ M1 已实现：`ClientWs` 用 `websockets.sync.client.connect` 建立连接，
 
 from __future__ import annotations
 
+import io
 import json
+import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import numpy as np
+from PIL import Image
 from websockets.sync.client import connect as _ws_connect
+
+
+@dataclass(frozen=True)
+class Frame:
+    """一帧像素观测（M3，DESIGN.md §9.2 二进制帧协议）。
+
+    - `frame_id`：客户端单调递增帧号（4B BE）
+    - `server_tick`：帧采集时已知的最新服务端 tick（4B BE；M3 占位 0，M8 tick 对齐启用）
+    - `wall_nanos`：采集墙钟时间戳（8B BE）
+    - `rgb`：JPEG 解码后的 RGB 像素（HxWx3 uint8，默认 224×224）
+    """
+
+    frame_id: int
+    server_tick: int
+    wall_nanos: int
+    rgb: np.ndarray
 
 
 class ClientWs:
@@ -92,12 +113,37 @@ class ClientWs:
         """下行 JSON 消息（M1 已实现，供 M2 动作下发复用）。"""
         self._send_json(msg)
 
-    def recv_frame(self, timeout: float = 2.0) -> Optional[bytes]:
-        """阻塞接收一帧上行帧（二进制）。
+    def recv_frame(self, timeout: float = 2.0) -> Optional[Frame]:
+        """阻塞接收一帧上行帧（M3：二进制帧头解析 + JPEG 解码）。
 
-        依赖 M3：解析 `[4B frame_id][4B tick][8B wall_nanos][JPEG]` 帧头。
+        二进制协议（DESIGN.md §9.2）：`[4B frame_id BE][4B server_tick BE]
+        [8B wall_nanos BE][JPEG bytes]`。
+
+        - 上行中可能夹杂 JSON 文本（action_ok / pong / state 等），自动跳过；
+        - 超时未收到帧返回 `None`；数据不足 16B 报错。
         """
-        raise NotImplementedError("M3 实现：帧头解析 + 二进制帧接收")
+        assert self._conn is not None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                raw = self._conn.recv(timeout=remaining)
+            except TimeoutError:
+                return None
+            if not isinstance(raw, bytes):
+                continue  # JSON 文本（action_ok/mode_ok 等），跳过继续等帧
+            if len(raw) < 16:
+                raise ValueError(f"二进制帧数据不足 16B 帧头: {len(raw)}B")
+            frame_id = int.from_bytes(raw[0:4], "big", signed=False)
+            server_tick = int.from_bytes(raw[4:8], "big", signed=False)
+            wall_nanos = int.from_bytes(raw[8:16], "big", signed=False)
+            jpeg = raw[16:]
+            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+            rgb = np.asarray(img, dtype=np.uint8)
+            return Frame(frame_id=frame_id, server_tick=server_tick,
+                         wall_nanos=wall_nanos, rgb=rgb)
 
     def recv_state(self, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
         """接收状态 JSON 上行。

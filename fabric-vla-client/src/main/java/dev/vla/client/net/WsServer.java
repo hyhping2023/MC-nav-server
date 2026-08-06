@@ -11,6 +11,7 @@ import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.WebSocketServer;
 
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -70,6 +71,22 @@ public class WsServer extends WebSocketServer {
     /** 当前模式是否为 API 模式（pong 上报用）。 */
     public boolean isApiMode() {
         return apiMode;
+    }
+
+    /** M3：是否存在连接中的会话（有会话才发帧，无会话丢弃）。 */
+    public boolean hasSession() {
+        return !sessions.isEmpty();
+    }
+
+    /** M3：二进制帧上行（DESIGN.md §9.2），发给所有连接中的会话。
+     *
+     * 每会话用 {@code slice()} 独立 ByteBuffer 视图，避免多会话共享 position。 */
+    public void sendBinary(ByteBuffer data) {
+        for (WebSocket conn : sessions.keySet()) {
+            if (conn.isOpen()) {
+                conn.send(data.slice());
+            }
+        }
     }
 
     @Override

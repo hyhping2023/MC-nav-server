@@ -694,6 +694,15 @@ Phase 0（环境/脚手架）
 - **验证**：build ✅；harness 三项全过（action 字段回显一致 / reset_camera / mode）；**`./gradlew runClient` 实机跑通**（loader 0.15.11→0.16.10 以兼容 fabric-api 0.92.11；mixin 零报错、渲染至标题屏、WS 30001 游戏内监听、实机 WS 指令通过）。
 - **遗留**：hotbar/drop/inventory 用 `getDefaultKey()`（用户改键不匹配）；attack 未补 timesPressed → 仅按住挖掘、单发 doAttack 不触发；camera 与 movement 至多 1 tick 相位差（M3 对齐时处理）。物理键鼠隔离为代码路径 + mixin 加载验证，真人目视检查留待 M3。
 
+**M3 完成记录（2026-08-06，客户端视觉 ✅，端到端跑通）**：
+- **`gfx/FrameGrabber.java`**：渲染线程抓帧——主 framebuffer `glBlitFramebuffer` 下采样到 224×224 小 FBO → `glReadPixels` RGBA（每帧分配，PBO 三缓冲属 M9 优化）；FrameData 入 `ConcurrentLinkedQueue`。
+- **`net/FrameSender.java`**：守护线程 JPEG（`TYPE_3BYTE_BGR`，ARGB 带 alpha 会抛 "Bogus input colorspace"）+ 二进制帧头 `[4B frame_id][4B last_server_tick=0 占位][8B wall_nanos][JPEG]` 经 WS 上行。
+- **抓帧钩子**：`WorldRenderEvents.LAST`（世界+实体渲染后、HUD 前；AFTER_TRANSLUCENT 在实体之前不可用）。
+- **autojoin**：`run/autojoin.txt`（`host:port`）→ `ConnectScreen.connect(...)`（1.20.1 标准入口，genSources 核实；非 getServerConnection）。
+- **Python**：`client_ws.recv_frame()`（解析二进制头 + JPEG→numpy，跳过 JSON 夹杂）；`scripts/random_agent.py`（100 步随机动作 + 收帧断言）。
+- **验收**：Purpur + runClient（autojoin 自动入服，离线名 Player249）→ WS 30001 → `random_agent --steps 100` → **`M3_OK frames=100`**，全部 `shape=(224,224,3)`，零超时，帧内容非空（mean≈160/std≈76）。
+- **遗留**：PBO 异步抓帧留 M9；`last_server_tick` 占位（M8 对齐）；run/autojoin.txt 已保留（下次 runClient 自动入服）。
+
 ### 13.5 Phase 2：Purpur 服务端世界引擎（可与 P1 并行）
 
 **目标**：gRPC + 世界重置 + 任务/奖励 + 体素 + 寻路，Python 端 `reset/step` 闭环。
@@ -819,7 +828,7 @@ M0 ─► M1 ─┬─► M2 ─► M3 ──┬──────────�
 | M0 | 环境脚手架 | P0 | — | 0.1-0.5 | 三端可跑：客户端可进服 / `vla_env` import / proto 代码生成 | ✅ |
 | M1 | 通信底座 | P1+P2 | M0 | 1.1, 2.1-2.2 | Python 可 ping 两端：WS `pong` + gRPC 返回 `server_tick` | ✅ |
 | M2 | 客户端控制 | P1 | M1 | 1.2-1.3 | API_MODE 物理键鼠完全失效；HUMAN_MODE 透明；无粘键 | ✅ |
-| M3 | 客户端视觉 | P1 | M1, M2 | 1.4-1.6 | 随机策略驱动移动/转向/攻击；224² 帧 ≥20fps 上行且与动作 1:1 | ⬜ |
+| M3 | 客户端视觉 | P1 | M1, M2 | 1.4-1.6 | 随机策略驱动移动/转向/攻击；224² 帧 ≥20fps 上行且与动作 1:1 | ✅ |
 | M4 | 世界引擎 | P2 | M1 | 2.3-2.4 | 两次 reset 体素一致；玩家态/背包/时间/实体正确重置 | ✅ |
 | M5 | 任务系统 | P2 | M4 | 2.5 | `collect_wood` 判定 success=true；reward 来自服务端事件 | ✅ |
 | M6 | 状态与寻路 | P2 | M4 | 2.6 | `GetVoxels` 与实景一致；`ComputePath` 输出可达航点 | ✅ |
@@ -935,7 +944,7 @@ fake-mc/
 ### 里程碑
 
 > 里程碑骨架（M0-M12：ID/阶段/依赖/任务/Exit/状态 + DAG）见 **§13.10**。
-> 当前状态（2026-08-06）：**M0/M1/M2/M4/M5/M6 全部 ✅**（记录见 §13.3-13.5）；剩 **M3（客户端视觉）**、**M7（Env 闭环）**、**M8（数据对齐）**。
+> 当前状态（2026-08-06）：**M0/M1/M2/M3/M4/M5/M6 全部 ✅**（记录见 §13.3-13.5）；剩 **M7（Env 闭环）**、**M8（数据对齐）**。
 
 ---
 
