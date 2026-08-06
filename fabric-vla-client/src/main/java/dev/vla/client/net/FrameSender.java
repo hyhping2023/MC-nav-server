@@ -94,7 +94,7 @@ public final class FrameSender implements Runnable {
             lastSend = System.currentTimeMillis();
 
             try {
-                byte[] jpeg = encodeJpeg(toSend.rgba);
+                byte[] jpeg = encodeJpeg(toSend.rgba, toSend.width, toSend.height);
                 server.sendBinary(pack(toSend, jpeg));
             } catch (Exception e) {
                 System.err.println("[vla-client] frame send error: " + e);
@@ -116,10 +116,11 @@ public final class FrameSender implements Runnable {
     /** RGBA(byte[]) → BGR BufferedImage → JPEG 字节。
      *
      * 注意：标准 JPEG 编码器不支持带 alpha 的图（TYPE_INT_ARGB 会抛
-     * "Bogus input colorspace"），故用 TYPE_3BYTE_BGR（JPEG 无 alpha 通道）。 */
-    private byte[] encodeJpeg(byte[] rgba) throws Exception {
-        BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_3BYTE_BGR);
-        int[] pixels = new int[width * height];
+     * "Bogus input colorspace"），故用 TYPE_3BYTE_BGR（JPEG 无 alpha 通道）。
+     * 尺寸取每帧的 width/height（抓帧分辨率可运行时切换，如 demo 原生分辨率）。 */
+    private byte[] encodeJpeg(byte[] rgba, int w, int h) throws Exception {
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_3BYTE_BGR);
+        int[] pixels = new int[w * h];
         for (int i = 0; i < pixels.length; i++) {
             int a = rgba[i * 4 + 3] & 0xFF;
             int r = rgba[i * 4] & 0xFF;
@@ -127,7 +128,7 @@ public final class FrameSender implements Runnable {
             int b = rgba[i * 4 + 2] & 0xFF;
             pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
         }
-        img.setRGB(0, 0, width, height, pixels, 0, width);
+        img.setRGB(0, 0, w, h, pixels, 0, w);
 
         ImageWriter writer = null;
         try (ByteArrayOutputStream out = new ByteArrayOutputStream();

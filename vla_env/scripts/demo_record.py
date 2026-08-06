@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ticks", type=int, default=2)
     p.add_argument("--half-extent", type=int, default=16)
     p.add_argument("--player", default="agent0")
+    p.add_argument("--capture", default="native",
+                   help="抓帧分辨率：native=游戏原始分辨率（保真+保留比例，推荐）或 WxH 如 1280x720")
     return p.parse_args()
 
 
@@ -84,6 +86,15 @@ def main() -> int:
             print("DEMO_FAIL: env.reset 未成功", file=sys.stderr)
             return 1
         print(f"[reset] OK pos={obs['player']['pos']}", flush=True)
+
+        # M7.2：切换抓帧分辨率（native → 游戏 framebuffer 原始分辨率，保真+保留比例）
+        if args.capture.lower() == "native":
+            env.ws.send({"cmd": "set_capture", "width": 0, "height": 0})
+        else:
+            w, h = (int(x) for x in args.capture.lower().split("x"))
+            env.ws.send({"cmd": "set_capture", "width": w, "height": h})
+        # 等客户端渲染线程重建 FBO（下一帧起生效）
+        time.sleep(0.5)
 
         # 录帧线程（消费全部 WS 帧；主线程只发动作/调 gRPC，不读 WS）
         stop_flag = threading.Event()

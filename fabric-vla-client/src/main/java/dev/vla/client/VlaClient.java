@@ -174,6 +174,20 @@ public final class VlaClient implements ClientModInitializer {
             }
 
             @Override
+            public void onSetCapture(int width, int height) {
+                LOGGER.info("[vla-client] WS set_capture {}x{} (0=原生)", width, height);
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    // FrameGrabber 的 GL 操作必须在渲染线程执行
+                    client.execute(() -> {
+                        if (frameGrabber != null) {
+                            frameGrabber.setResolution(width, height);
+                        }
+                    });
+                }
+            }
+
+            @Override
             public void onConnect(String session) {
                 LOGGER.info("[vla-client] WS session connected: {}", session);
             }

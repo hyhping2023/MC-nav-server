@@ -43,6 +43,10 @@ public class WsServer extends WebSocketServer {
         /** M2：收到视角重置指令。 */
         default void onResetCamera(float yaw, float pitch) {
         }
+
+        /** M7.2：运行时切换抓帧分辨率（0 = 原生 framebuffer 分辨率，保留游戏原始比例）。 */
+        default void onSetCapture(int width, int height) {
+        }
     }
 
     public static final String API_MODE = "api";
@@ -173,6 +177,17 @@ public class WsServer extends WebSocketServer {
                 handler.onResetCamera(yaw, pitch);
                 JsonObject ok = new JsonObject();
                 ok.addProperty("type", "camera_ok");
+                conn.send(GSON.toJson(ok));
+            }
+            case "set_capture" -> {
+                // 0 = 原生 framebuffer 分辨率（保留游戏原始比例）；否则显式 WxH
+                int w = obj.has("width") ? obj.get("width").getAsInt() : 0;
+                int h = obj.has("height") ? obj.get("height").getAsInt() : 0;
+                handler.onSetCapture(w, h);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "capture_ok");
+                ok.addProperty("width", w);
+                ok.addProperty("height", h);
                 conn.send(GSON.toJson(ok));
             }
             default -> sendError(conn, "unknown cmd: " + cmd);
