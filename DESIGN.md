@@ -773,6 +773,14 @@ Phase 0（环境/脚手架）
 - 4 env 并行稳定运行 ≥1h，无死锁/卡死。
 - 产出首份可验证数据集。
 
+**M8 完成记录（2026-08-06，数据对齐 ✅）**：
+- **服务端 `vla:tick` 广播**（`VlaPlugin.java`）：`registerOutgoingPluginChannel("vla:tick")` + `runTaskTimer(20L, 1L)` 每 tick `sendPluginMessage` 12B `[4B serverTick][8B wallNanos]`（ByteBuffer 大端，无玩家不广播）。
+- **客户端接收**（`VlaClient.java`）：`ClientPlayNetworking.registerGlobalReceiver("vla:tick")` 读 12B → `volatile long lastServerTick`（静态 `getLastServerTick()`；`catch Throwable` 防网络线程崩）；`FrameGrabber.FrameData` 增 `lastServerTick` 字段、`FrameSender` 帧头写真实值。
+- **`lockstep.py`**：`assert_step_alignment`（窗口 `0<=server_tick-frame_tick<=ticks_per_step+tol` + frame_id/tick 单调不减）+ `Aligner`（累 mismatch/max_diff，`report()` 对齐率）。
+- **`scripts/collect_episodes.py`**：N episode 全栈采集（随机动作，`/tmp` JSONL）+ 四者计数断言 + 对齐率汇总。
+- **验收**：10ep×60steps → `frames=600 actions=600 rewards=600 states=600 counts_consistent=True`；`align steps=600 mismatch=0 align_rate=1.00 max_diff=3`（tol=2，窗口 ticks+2=4）；`M8_ALIGN_OK episodes=10 align_rate=1.00`。
+- **踩坑**：① WS 二进制帧撞 `_recv_json` 的 utf-32-be BOM 解析（帧头 frame_id=0x0000FEFF 时），修 `_recv_json` 跳过 bytes/乱码仅收 dict，episode 间切换从 ~10s 降到即时；② 客户端被遮挡时 MC 静默断连（Throwable catch 防御，未根因）；③ 多屏截图看不到被遮窗口，用 jstack + 抓帧计数确认渲染。
+
 ### 13.7 Phase 4：VLA 接入与数据管线
 
 **目标**：人类演示采集、导出器、VLA 闭环、自动课程。
@@ -844,7 +852,7 @@ M0 ─► M1 ─┬─► M2 ─► M3 ──┬──────────�
 | M5 | 任务系统 | P2 | M4 | 2.5 | `collect_wood` 判定 success=true；reward 来自服务端事件 | ✅ |
 | M6 | 状态与寻路 | P2 | M4 | 2.6 | `GetVoxels` 与实景一致；`ComputePath` 输出可达航点 | ✅ |
 | M7 | Env 闭环 | P2 | M2, M3, M5, M6 | 2.7 | `env.reset/step` 端到端跑通 `collect_wood`（随机/脚本策略） | ✅ |
-| M8 | 数据对齐 | P3 | M7 | 3.1 | 10 episode 帧/状态/动作/奖励计数一致 + tick 断言 100% | ⬜ |
+| M8 | 数据对齐 | P3 | M7 | 3.1 | 10 episode 帧/状态/动作/奖励计数一致 + tick 断言 100% | ✅ |
 | M9 | 性能与并行 | P3 | M8 | 3.2-3.3 | 抓帧 <1ms；4 env 并行稳定 ≥1h | ⬜ |
 | M10 | 数据管线 | P3+P4 | M8, M9 | 3.4, 4.2 | 首份可验证数据集 + WDS/HF/RLDS 导出冒烟 | ⬜ |
 | M11 | 人类演示 | P4 | M3 | 4.1 | 人类演示数据与自动 rollout 同 canonical 格式 | ⬜ |
@@ -955,7 +963,7 @@ fake-mc/
 ### 里程碑
 
 > 里程碑骨架（M0-M12：ID/阶段/依赖/任务/Exit/状态 + DAG）见 **§13.10**。
-> 当前状态（2026-08-06）：**M0-M7 全部 ✅**（记录见 §13.3-13.5）；剩 **M8（数据对齐）**。
+> 当前状态（2026-08-06）：**M0-M8 全部 ✅**（记录见 §13.3-13.6）；剩 **M9（性能与并行）**、**M10（数据管线）**、**M11（人类演示）**、**M12（VLA 闭环）**。
 
 ---
 

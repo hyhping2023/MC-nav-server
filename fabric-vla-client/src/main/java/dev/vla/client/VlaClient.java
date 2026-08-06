@@ -9,15 +9,20 @@ import dev.vla.client.net.WsServer;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+import net.fabricmc.fabric.api.networking.v1.PacketSender;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ConnectScreen;
 import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.Session;
+import net.minecraft.network.PacketByteBuf;
+import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,6 +74,10 @@ public final class VlaClient implements ClientModInitializer {
     /** M7.1：切到 API 模式前的 pauseOnLostFocus 原值（退出时恢复）。 */
     private boolean savedPauseOnLostFocus = true;
 
+    /** M8：最近一次经 vla:tick 插件消息收到的服务端权威 tick（网络线程写入、渲染线程读取）。
+     *  -1 表示尚未收到任何广播（帧打标时回退 0）。 */
+    private static volatile long lastServerTick = -1;
+
     /** M3：帧队列（渲染线程只入队，FrameSender 后台线程消费编码+上行）。 */
     private final ConcurrentLinkedQueue<FrameGrabber.FrameData> frameQueue = new ConcurrentLinkedQueue<>();
 
@@ -83,9 +92,35 @@ public final class VlaClient implements ClientModInitializer {
         LOGGER.info("[vla-client] VlaClient loaded (M3)");
 
         startWsServer();
+        registerTickChannel();
         registerTickHandler();
         registerFramePipeline();
         registerAutoJoin();
+    }
+
+    /**
+     * M8：接收服务端 vla:tick 插件消息（DESIGN.md §5.6），把权威 server_tick 写入
+     * {@link #lastServerTick}，供帧打标（FrameGrabber）与 Python lockstep 对齐。
+     *
+     * <p>payload 12B（§5.6）：`[4B int serverTick BE][8B long wallNanos BE]`。
+     * registerGlobalReceiver 同时把频道注册到客户端连接，服务端 sendPluginMessage 才可达
+     * （1.20.1 签名 genSources/字节码核实：PlayChannelHandler#receive(client, handler, buf, sender)）。
+     */
+    private void registerTickChannel() {
+        ClientPlayNetworking.registerGlobalReceiver(new Identifier("vla", "tick"),
+                (MinecraftClient client, ClientPlayNetworkHandler handler,
+                 PacketByteBuf buf, PacketSender responseSender) -> {
+                    try {
+                        int tick = buf.readInt();
+                        buf.readLong(); // wallNanos（本地时钟无跨机漂移，暂不使用）
+                        lastServerTick = tick;
+                    } catch (Throwable t) {
+                        // 防御：读失败（payload 长度异常/通道错位）只记日志，不让网络线程崩
+                        // ——崩了会让 server 30s 后 kick（read timeout），表现为 collect_episodes
+                        // 跑几个 episode 后 server 侧断连。
+                        LOGGER.warn("[vla-client] vla:tick recv failed: {}", t.getMessage());
+                    }
+                });
     }
 
     private void startWsServer() {
@@ -317,6 +352,11 @@ public final class VlaClient implements ClientModInitializer {
 
     public static ActionCmd getCurrentAction() {
         return currentAction.get();
+    }
+
+    /** M8：帧采集时读取最近已知服务端权威 tick（未收到任何 vla:tick 广播时为 -1）。 */
+    public static long getLastServerTick() {
+        return lastServerTick;
     }
 
     public static VlaClient getInstance() {

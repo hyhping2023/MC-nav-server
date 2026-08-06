@@ -1,5 +1,6 @@
 package dev.vla.client.gfx;
 
+import dev.vla.client.VlaClient;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.GL11;
@@ -17,8 +18,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 读出 RGBA 并上下翻转（GL 左下原点 → 图像左上原点），打包成 {@link FrameData}
  * 进无锁队列；JPEG 编码与 WS 上行放在后台线程 {@code FrameSender}（渲染线程零编码）。
  *
- * <p>帧头协议（DESIGN.md §9.2）：frame_id 由本类单调递增；lastServerTick 为 M8
- * tick 对齐占位（先填 0）；wallNanos 取采集时刻墙钟。
+ * <p>帧头协议（DESIGN.md §9.2）：frame_id 由本类单调递增；lastServerTick 为 M8 经
+ * vla:tick 插件消息缓存的服务端权威 tick（VlaClient.getLastServerTick）；wallNanos 取
+ * 采集时刻墙钟。
  */
 public final class FrameGrabber {
 
@@ -105,8 +107,11 @@ public final class FrameGrabber {
             System.arraycopy(raw, (SIZE - 1 - y) * SIZE * 4, rgba, y * SIZE * 4, SIZE * 4);
         }
 
-        // lastServerTick=0 占位（M8 tick 对齐才填真实值）
-        queue.add(new FrameData(rgba, frameId.getAndIncrement(), System.nanoTime(), 0));
+        // M8：帧打标真实 lastServerTick（VlaClient 经 vla:tick 收到的服务端权威 tick；
+        // 尚未收到广播（-1）时回退 0，避免写入 unsigned 全 1 破坏对齐统计）
+        long tick = VlaClient.getLastServerTick();
+        int lastServerTick = (tick >= 0 && tick <= Integer.MAX_VALUE) ? (int) tick : 0;
+        queue.add(new FrameData(rgba, frameId.getAndIncrement(), System.nanoTime(), lastServerTick));
     }
 
     /** 一帧像素数据；仅传引用（ConcurrentLinkedQueue），渲染线程零编码。 */

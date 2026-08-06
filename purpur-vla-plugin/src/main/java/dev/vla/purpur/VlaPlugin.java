@@ -12,6 +12,7 @@ import io.grpc.Server;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.protobuf.services.ProtoReflectionService;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
@@ -45,6 +46,9 @@ public class VlaPlugin extends JavaPlugin implements Listener {
     /** gRPC 监听端口（与 vla_env 客户端契约一致）。 */
     public static final int GRPC_PORT = 50051;
 
+    /** M8：tick 广播插件消息频道（DESIGN.md §5.6）。 */
+    public static final String TICK_CHANNEL = "vla:tick";
+
     private Server grpcServer;
     private AgentManager agentManager;
     private ResetEngine resetEngine;
@@ -60,6 +64,11 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         Bukkit.getPluginManager().registerEvents(agentManager, this);
         // M5：任务相关事件（方块破坏/放置、实体死亡、玩家移动 → TaskManager 判定）
         Bukkit.getPluginManager().registerEvents(this, this);
+
+        // M8：vla:tick 频道（§5.6）——每 tick 向在线玩家广播权威 server_tick + 墙钟，
+        // 客户端据此给帧打 last_server_tick，供 Python lockstep 对齐（§9.3）。
+        Bukkit.getMessenger().registerOutgoingPluginChannel(this, TICK_CHANNEL);
+        Bukkit.getScheduler().runTaskTimer(this, this::broadcastTick, 20L, 1L);
 
         try {
             grpcServer = NettyServerBuilder
@@ -110,6 +119,25 @@ public class VlaPlugin extends JavaPlugin implements Listener {
 
     public TaskManager getTaskManager() {
         return taskManager;
+    }
+
+    /**
+     * M8：每 tick 向所有在线玩家广播 `vla:tick` payload（主线程，runTaskTimer 1L）。
+     *
+     * <p>payload 12B：`[4B int serverTick=Bukkit.getCurrentTick()][8B long wallNanos=
+     * System.nanoTime()]`（大端）。无玩家时不广播（省 CPU）。日志 debug 级。
+     */
+    private void broadcastTick() {
+        if (Bukkit.getOnlinePlayers().isEmpty()) {
+            return;
+        }
+        int tick = Bukkit.getCurrentTick();
+        long wallNanos = System.nanoTime();
+        byte[] payload = new byte[12];
+        ByteBuffer.wrap(payload).putInt(tick).putLong(wallNanos);
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            p.sendPluginMessage(this, TICK_CHANNEL, payload);
+        }
     }
 
     /** 供命令/日志探测 gRPC server 是否仍处于运行状态。 */

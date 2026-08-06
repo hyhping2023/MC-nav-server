@@ -106,12 +106,38 @@ class ClientWs:
             self._conn.send(json.dumps(msg, ensure_ascii=False))
 
     def _recv_json(self, timeout: float = 5.0) -> Dict[str, Any]:
+        """接收一条 JSON 上行（mode_ok / pong / camera_ok / state 等）。
+
+        客户端以满帧率持续上送二进制帧（FrameSender 30fps），上一 step 收帧后
+        与本步 send 之间会有若干二进制帧堆积在 WS 缓冲。文本/二进制是独立通道
+        但同一连接内按发送顺序排队：直接 ``recv()`` 可能拿到残留的二进制帧，
+        进而被 ``json.loads`` 当 utf-32/utf-8 解析报错（M8 复现：episode 间
+        env.reset 失败 5 次后才拿到 mode_ok）。
+
+        修复：跳过 bytes（二进制帧归 recv_frame 消费），只把 str 交给 json.loads。
+        """
         assert self._conn is not None
-        raw = self._conn.recv(timeout=timeout)
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError(f"非 JSON 对象上行: {raw!r}")
-        return data
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"_recv_json: {timeout}s 内未收到 JSON 文本上行")
+            try:
+                raw = self._conn.recv(timeout=remaining)
+            except TimeoutError:
+                raise TimeoutError(f"_recv_json: {timeout}s 内未收到 JSON 文本上行")
+            if isinstance(raw, (bytes, bytearray)):
+                # 二进制帧（pixel frame），跳过继续等 JSON 文本
+                continue
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # 乱码/非 JSON 文本，跳过继续等
+                continue
+            if isinstance(data, dict):
+                return data
+            # 非 dict 的 JSON（如 list/字符串）也跳过
+            continue
 
     def ping(self) -> Dict[str, Any]:
         """Ping：发送 `{"cmd":"ping"}` 并接收一条 JSON，校验 type=="pong"。
