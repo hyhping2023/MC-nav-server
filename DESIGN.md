@@ -730,6 +730,12 @@ Phase 0（环境/脚手架）
 - **踩坑记录**：① 本仓库 paper-api 无 `World#setBlockState(...,applyPhysics)`，用 `Block#setBlockData(data,false)`（语义相同）；② **FIFO 控制台命令不带 `/` 前缀**（`vla status` 有效、`/vla status` 报 Unknown command）；③ dig 踢连接→session 重建，region 持久化解决。
 - **遗留**：`vla_env/server_grpc.py::reset_world()` 仍占位（属 M7 Python 集成）；世界留有 dig 痕迹（基线即捕获态，不影响确定性）。
 
+**M5+M6 完成记录（2026-08-06，任务系统 + 体素/寻路 ✅）**：
+- **任务系统（M5）**：`task/TaskSpec.java`、`task/TaskRegistry.java`（内置 `collect_wood`=block_mined×4 oak_log、`craft_planks` 占位）、`task/Predicates.java`（block_mined / inventory_contains / entity_killed / player_at）、`task/TaskManager.java`（EpisodeState + `step(awaitTicks)` 经 runTaskLater **主线程回调**结算，server-authoritative）；RPC `setTask/getStepResult/getState`（+`generateTask` 占位）；命令 `vla task/taskinfo`。
+- **状态与寻路（M6）**：`world/VoxelReader.java`（paper-api `getBlockData(x,y,z)` 快速读 + palette 编码，**不用 NMS**）；`path/AStar.java`（3D 8 方向 + 跳跃，成本表，open set 确定性排序，拐点压缩，**目标不可站自动上移至首个可站格**）；RPC `getVoxels/computePath`；命令 `vla voxels/path`。
+- **验收**：`collect_wood` 挖 4 原木 → `taskinfo success=true counters={block_mined:oak_log=4}`，`GetStepResult reward=10.0 terminated=True`；`GetVoxels(half_extent=8)` palette=25/data=4913/origin=(56,60,-56)/size=17；`ComputePath(+30格)` found=True waypoints=11（翻越山丘）。
+- **踩坑**：① AStar 目标在山体内 → 不可站时上移；② paper 快速读块是 `getBlockData`（非 getBlockState）；③ 服务端启动必须 `run_in_background=true`，否则工具在前台命令结束时 SIGTERM 掉；④ craft_planks 未验收（占位）。
+
 ### 13.6 Phase 3：数据对齐与性能优化（最关键）
 
 **目标**：tick/frame 严格对齐、抓帧 <1ms、多 env 并行稳定。
@@ -815,8 +821,8 @@ M0 ─► M1 ─┬─► M2 ─► M3 ──┬──────────�
 | M2 | 客户端控制 | P1 | M1 | 1.2-1.3 | API_MODE 物理键鼠完全失效；HUMAN_MODE 透明；无粘键 | ✅ |
 | M3 | 客户端视觉 | P1 | M1, M2 | 1.4-1.6 | 随机策略驱动移动/转向/攻击；224² 帧 ≥20fps 上行且与动作 1:1 | ⬜ |
 | M4 | 世界引擎 | P2 | M1 | 2.3-2.4 | 两次 reset 体素一致；玩家态/背包/时间/实体正确重置 | ✅ |
-| M5 | 任务系统 | P2 | M4 | 2.5 | `collect_wood` 判定 success=true；reward 来自服务端事件 | ⬜ |
-| M6 | 状态与寻路 | P2 | M4 | 2.6 | `GetVoxels` 与实景一致；`ComputePath` 输出可达航点 | ⬜ |
+| M5 | 任务系统 | P2 | M4 | 2.5 | `collect_wood` 判定 success=true；reward 来自服务端事件 | ✅ |
+| M6 | 状态与寻路 | P2 | M4 | 2.6 | `GetVoxels` 与实景一致；`ComputePath` 输出可达航点 | ✅ |
 | M7 | Env 闭环 | P2 | M2, M3, M5, M6 | 2.7 | `env.reset/step` 端到端跑通 `collect_wood`（随机/脚本策略） | ⬜ |
 | M8 | 数据对齐 | P3 | M7 | 3.1 | 10 episode 帧/状态/动作/奖励计数一致 + tick 断言 100% | ⬜ |
 | M9 | 性能与并行 | P3 | M8 | 3.2-3.3 | 抓帧 <1ms；4 env 并行稳定 ≥1h | ⬜ |
@@ -929,7 +935,7 @@ fake-mc/
 ### 里程碑
 
 > 里程碑骨架（M0-M12：ID/阶段/依赖/任务/Exit/状态 + DAG）见 **§13.10**。
-> 当前状态：**M0 ✅**（§13.3）、**M1 ✅**、**M2 ✅**（§13.4）、**M4 ✅**（§13.5，均 2026-08-06）；M3（客户端视觉）与 M5/M6（服务端）可并行。
+> 当前状态（2026-08-06）：**M0/M1/M2/M4/M5/M6 全部 ✅**（记录见 §13.3-13.5）；剩 **M3（客户端视觉）**、**M7（Env 闭环）**、**M8（数据对齐）**。
 
 ---
 
