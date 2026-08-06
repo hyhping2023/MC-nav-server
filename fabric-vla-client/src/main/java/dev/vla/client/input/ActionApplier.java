@@ -43,25 +43,32 @@ public final class ActionApplier {
             return;
         }
 
-        // 1) 视角增量（setYaw/setPitch 内部处理 yaw 环绕；pitch 在此额外夹紧）
-        player.setPitch(MathHelper.clamp(player.getPitch() + cmd.camera[0], -90.0f, 90.0f));
-        player.setYaw(player.getYaw() + cmd.camera[1]);
+        // 1) 视角增量：一次性字段，应用后清零（动作电平保持时防止每 tick 重复累加）
+        if (cmd.camera != null) {
+            player.setPitch(MathHelper.clamp(player.getPitch() + cmd.camera[0], -90.0f, 90.0f));
+            player.setYaw(player.getYaw() + cmd.camera[1]);
+            cmd.camera[0] = 0.0f;
+            cmd.camera[1] = 0.0f;
+        }
 
-        // 2) 长按型按钮（isPressed() 驱动）
+        // 2) 长按型按钮（isPressed() 驱动，电平保持：持续按住直到新动作置 false）
         client.options.attackKey.setPressed(cmd.attack);
         client.options.useKey.setPressed(cmd.use);
 
-        // 3) 离散型按钮（wasPressed() 驱动，需补 timesPressed）
+        // 3) 离散型按钮（wasPressed() 驱动，需补 timesPressed）；一次性，应用后清零
         if (cmd.drop) {
             pressDiscrete(client.options.dropKey);
+            cmd.drop = false;
         }
         if (cmd.inventory) {
             pressDiscrete(client.options.inventoryKey);
+            cmd.inventory = false;
         }
 
-        // 4) 快捷栏 0-8：模拟按键选择，下一 tick（resetKeys）释放
+        // 4) 快捷栏 0-8：模拟按键选择；一次性，应用后清零（下一 tick resetKeys 释放）
         if (cmd.hotbar >= 0 && cmd.hotbar < client.options.hotbarKeys.length) {
             pressDiscrete(client.options.hotbarKeys[cmd.hotbar]);
+            cmd.hotbar = -1;
         }
     }
 

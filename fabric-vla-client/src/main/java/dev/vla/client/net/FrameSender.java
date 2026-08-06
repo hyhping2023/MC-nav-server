@@ -23,6 +23,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public final class FrameSender implements Runnable {
 
     private static final float JPEG_QUALITY = 0.85f;
+    /** M7 流控：帧上行上限（30fps）。客户端满帧率上行 >> Python 每 step 收一帧，
+     * 不限制会让 TCP 缓冲堆积、客户端 WS 写阻塞（keepalive pong 发不出 → 连接判死）。 */
+    private static final long MIN_SEND_INTERVAL_MS = 33;
 
     private final WsServer server;
     private final ConcurrentLinkedQueue<FrameGrabber.FrameData> queue;
@@ -56,6 +59,7 @@ public final class FrameSender implements Runnable {
 
     @Override
     public void run() {
+        long lastSend = 0;
         while (running) {
             FrameGrabber.FrameData frame = queue.poll();
             if (frame == null) {
@@ -70,9 +74,28 @@ public final class FrameSender implements Runnable {
             if (!server.hasSession()) {
                 continue; // 无连接会话，丢弃
             }
+
+            // M7 流控：限速（间隔未到先 sleep），并把积压帧丢弃只留最新一帧
+            long now = System.currentTimeMillis();
+            long wait = MIN_SEND_INTERVAL_MS - (now - lastSend);
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            FrameGrabber.FrameData toSend = frame;
+            FrameGrabber.FrameData newest;
+            while ((newest = queue.poll()) != null) {
+                toSend = newest; // 丢弃中间帧，只保留最新
+            }
+            lastSend = System.currentTimeMillis();
+
             try {
-                byte[] jpeg = encodeJpeg(frame.rgba);
-                server.sendBinary(pack(frame, jpeg));
+                byte[] jpeg = encodeJpeg(toSend.rgba);
+                server.sendBinary(pack(toSend, jpeg));
             } catch (Exception e) {
                 System.err.println("[vla-client] frame send error: " + e);
             }

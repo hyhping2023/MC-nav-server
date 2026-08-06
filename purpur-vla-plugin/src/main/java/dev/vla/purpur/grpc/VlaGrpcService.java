@@ -175,16 +175,39 @@ public class VlaGrpcService extends VlaServerGrpc.VlaServerImplBase {
                 return;
             }
             Location loc = player.getLocation();
+            org.bukkit.util.Vector vel = player.getVelocity();
             ItemStack held = player.getInventory().getItemInMainHand();
             String heldItem = (held == null || held.getType().isAir())
                     ? "minecraft:air" : held.getType().getKey().toString();
+            // 背包 main（36 格，非空气项）
+            StringBuilder main = new StringBuilder();
+            ItemStack[] contents = player.getInventory().getContents();
+            for (int i = 0; i < 36; i++) {
+                ItemStack it = contents[i];
+                if (it != null && !it.getType().isAir()) {
+                    if (main.length() > 0) {
+                        main.append(",");
+                    }
+                    main.append("{\"slot\":").append(i)
+                            .append(",\"item\":\"").append(it.getType().getKey()).append("\"")
+                            .append(",\"count\":").append(it.getAmount()).append("}");
+                }
+            }
             // 字段名对齐 DESIGN.md §8（player.pos/hp/hunger、inventory.selected_slot/held_item）
             String json = String.format(Locale.ROOT,
-                    "{\"player\":{\"pos\":[%.2f,%.2f,%.2f],\"hp\":%.1f,\"hunger\":%d},"
-                            + "\"inventory\":{\"selected_slot\":%d,\"held_item\":\"%s\"}}",
+                    "{\"player\":{\"pos\":[%.2f,%.2f,%.2f],\"hp\":%.1f,\"hunger\":%d,"
+                            + "\"yaw\":%.1f,\"pitch\":%.1f,\"on_ground\":%b,\"dimension\":\"%s\","
+                            + "\"velocity\":[%.3f,%.3f,%.3f]},"
+                            + "\"inventory\":{\"selected_slot\":%d,\"held_item\":\"%s\",\"main\":[%s]},"
+                            + "\"stats\":{\"xp\":%d,\"level\":%d,\"playtime\":%.1f}}",
                     loc.getX(), loc.getY(), loc.getZ(),
                     player.getHealth(), player.getFoodLevel(),
-                    player.getInventory().getHeldItemSlot(), heldItem);
+                    loc.getYaw(), loc.getPitch(),
+                    player.isOnGround(), player.getWorld().getName(),
+                    vel.getX(), vel.getY(), vel.getZ(),
+                    player.getInventory().getHeldItemSlot(), heldItem, main,
+                    player.getTotalExperience(), player.getLevel(),
+                    player.getStatistic(org.bukkit.Statistic.PLAY_ONE_MINUTE) / 20.0);
             responseObserver.onNext(StateReply.newBuilder().setJson(json).build());
             responseObserver.onCompleted();
         } catch (Exception e) {

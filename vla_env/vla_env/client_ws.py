@@ -43,6 +43,18 @@ class Frame:
     rgb: np.ndarray
 
 
+def _decode_frame(raw: bytes) -> Frame:
+    """解析一条二进制帧消息：`[4B frame_id BE][4B server_tick BE][8B wall_nanos BE][JPEG]`。"""
+    frame_id = int.from_bytes(raw[0:4], "big", signed=False)
+    server_tick = int.from_bytes(raw[4:8], "big", signed=False)
+    wall_nanos = int.from_bytes(raw[8:16], "big", signed=False)
+    jpeg = raw[16:]
+    img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    rgb = np.asarray(img, dtype=np.uint8)
+    return Frame(frame_id=frame_id, server_tick=server_tick,
+                 wall_nanos=wall_nanos, rgb=rgb)
+
+
 class ClientWs:
     """客户端 WS client（M1：websockets.sync 客户端）。
 
@@ -67,15 +79,31 @@ class ClientWs:
         self.close()
 
     def connect(self) -> None:
-        """建立 WS 连接（M1 已实现；惰性，重复调用幂等）。"""
+        """建立 WS 连接（M1 已实现；惰性，重复调用幂等）。
+
+        关闭 keepalive ping（ping_interval=None）：本地回环帧流生产速率高于
+        消费速率（客户端满帧率上行 vs Python 每 step 收一帧），TCP 缓冲区堆积时
+        客户端 WS 线程会阻塞写，导致 keepalive pong 长时间无法发出、连接被
+        websockets 判死（1011）。M7 改为不主动 ping，由帧流消费驱动流控。
+        """
         if self._conn is not None:
             return
-        self._conn = _ws_connect(self.url)
+        self._conn = _ws_connect(self.url, ping_interval=None)
 
     def _send_json(self, msg: Dict[str, Any]) -> None:
         self.connect()
         assert self._conn is not None
-        self._conn.send(json.dumps(msg, ensure_ascii=False))
+        try:
+            self._conn.send(json.dumps(msg, ensure_ascii=False))
+        except Exception:  # noqa: BLE001 —— 断线/阻塞等，重连一次再试
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+            self.connect()
+            assert self._conn is not None
+            self._conn.send(json.dumps(msg, ensure_ascii=False))
 
     def _recv_json(self, timeout: float = 5.0) -> Dict[str, Any]:
         assert self._conn is not None
@@ -113,6 +141,16 @@ class ClientWs:
         """下行 JSON 消息（M1 已实现，供 M2 动作下发复用）。"""
         self._send_json(msg)
 
+    def send_action(self, action: Dict[str, Any]) -> None:
+        """下行原始动作 dict（M7）：经 action_space.to_ws 转 `{"cmd":"action",...}`。
+
+        注意客户端 ActionCmd#getBool 用 Gson getAsBoolean 解析，按键必须是真布尔
+        （整数 1 会被解析为 false），to_ws 负责转换。
+        """
+        from .action_space import to_ws
+
+        self._send_json(to_ws(action))
+
     def recv_frame(self, timeout: float = 2.0) -> Optional[Frame]:
         """阻塞接收一帧上行帧（M3：二进制帧头解析 + JPEG 解码）。
 
@@ -136,21 +174,71 @@ class ClientWs:
                 continue  # JSON 文本（action_ok/mode_ok 等），跳过继续等帧
             if len(raw) < 16:
                 raise ValueError(f"二进制帧数据不足 16B 帧头: {len(raw)}B")
-            frame_id = int.from_bytes(raw[0:4], "big", signed=False)
-            server_tick = int.from_bytes(raw[4:8], "big", signed=False)
-            wall_nanos = int.from_bytes(raw[8:16], "big", signed=False)
-            jpeg = raw[16:]
-            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-            rgb = np.asarray(img, dtype=np.uint8)
-            return Frame(frame_id=frame_id, server_tick=server_tick,
-                         wall_nanos=wall_nanos, rgb=rgb)
+            return _decode_frame(raw)
+
+    def recv_frame_latest(self, timeout: float = 2.0, drain_window: float = 0.03) -> Optional[Frame]:
+        """收一帧并尽量排空积压帧（M7：帧流生产 >> 消费时的流控兜底）。
+
+        客户端以满帧率上行、Python 每 step 收一帧，TCP 缓冲区会逐渐堆积导致
+        客户端 WS 写阻塞（进而 keepalive 无 pong）。本方法在收到**首帧**后只再等
+        {@code drain_window} 短窗口排空积压（消费掉但返回最新一帧），随即返回，
+        保持 Python 侧读缓冲低位、且 step 不被 2s 帧等待拖慢。
+
+        返回最新 Frame；超时未收到任何帧返回 None（跳过 JSON 文本消息）。
+        """
+        assert self._conn is not None
+        deadline = time.monotonic() + timeout
+        first: Optional[Frame] = None
+        # 1) 等首帧（忽略 JSON 文本）
+        while first is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                raw = self._conn.recv(timeout=remaining)
+            except TimeoutError:
+                return None
+            if isinstance(raw, bytes) and len(raw) >= 16:
+                first = _decode_frame(raw)
+            # 非 bytes（JSON）或坏帧头跳过继续等
+        # 2) 短窗口排空积压，返回最新一帧
+        last = first
+        idle = time.monotonic() + drain_window
+        while True:
+            rem = idle - time.monotonic()
+            if rem <= 0:
+                return last
+            try:
+                more = self._conn.recv(timeout=rem)
+            except TimeoutError:
+                return last
+            if isinstance(more, bytes) and len(more) >= 16:
+                last = _decode_frame(more)
 
     def recv_state(self, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
-        """接收状态 JSON 上行。
+        """接收状态 JSON 上行（aimed_block / held_item / fps 等）。
 
-        依赖 M3：aimed_block / held_item / fps 等客户端侧状态。
+        状态上行是文本消息；若收到二进制帧则丢弃继续等 JSON。
         """
-        raise NotImplementedError("M3 实现：状态 JSON 接收")
+        assert self._conn is not None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                raw = self._conn.recv(timeout=remaining)
+            except TimeoutError:
+                return None
+            if isinstance(raw, bytes):
+                continue  # 二进制帧，跳过继续等 JSON 状态
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
 
     def close(self) -> None:
         """断开连接：发 disconnect（等服务端 bye）再关闭（M1 已实现）。"""

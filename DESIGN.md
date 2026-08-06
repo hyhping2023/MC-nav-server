@@ -745,6 +745,17 @@ Phase 0（环境/脚手架）
 - **验收**：`collect_wood` 挖 4 原木 → `taskinfo success=true counters={block_mined:oak_log=4}`，`GetStepResult reward=10.0 terminated=True`；`GetVoxels(half_extent=8)` palette=25/data=4913/origin=(56,60,-56)/size=17；`ComputePath(+30格)` found=True waypoints=11（翻越山丘）。
 - **踩坑**：① AStar 目标在山体内 → 不可站时上移；② paper 快速读块是 `getBlockData`（非 getBlockState）；③ 服务端启动必须 `run_in_background=true`，否则工具在前台命令结束时 SIGTERM 掉；④ craft_planks 未验收（占位）。
 
+**M7 完成记录（2026-08-06，Env 闭环 ✅ 端到端跑通）**：
+- **Python**：`server_grpc.py` 全 RPC 封装（reset_world/set_task/get_step_result/get_state/get_voxels/compute_path…）；`obs.py`（pov+state+task 拼装）、`action_space.py`、`env.py`（`MinecraftEnv`：reset=ResetWorld→SetTask→mode api→收首帧→GetState；step=WS 动作→收帧→GetStepResult 结算→GetState，lockstep server-authoritative）；`scripts/collect_wood_agent.py` 脚本策略。
+- **客户端**：`MinecraftClientAccessor`（session 用户名覆盖 agent0）、`MinecraftClientMixin`（API 模式**阻止 GameMenuScreen 被 setScreen 安装**）、`FrameSender` 30fps 流控、autojoin.txt 两行（host + 用户名）。
+- **M7.1 修复（用户反馈：API 模式仍抓鼠标 + 失焦弹菜单；也是挖掘失效根因）**：
+  - 根因：窗口失焦 → 原版打开 GameMenuScreen → `handleInputEvents` 被跳过 → 挖掘（handleBlockBreaking）完全不执行（实测 screen=GameMenuScreen 41/42 采样）；移动经 KeyboardInputMixin 直接写 input 不受影响 → 表现为"能走但挖不动"。
+  - 修复① `MouseMixin` 新增 `lockCursor` HEAD cancel（API 模式**不物理抓取鼠标**，光标自由）；`isCursorLocked` 谎报 true 保留（handleBlockBreaking 依赖）。
+  - 修复② `VlaClient.onModeChange`：进入 API 置 `options.pauseOnLostFocus=false` + `unlockCursor`，退出恢复原值；配合 MinecraftClientMixin 双保险。
+  - 修复③ **动作电平保持**：END_CLIENT_TICK 不再 `getAndSet(null)` 消费动作，`currentAction` 持续持有直到被新动作替换（env.step 跨 5-10 ticks，原按 tick 消费使 forward/attack 占空比极低 → 蠕动/挖不动）；一次性字段（camera/hotbar/drop/inventory）在 `ActionApplier.apply` 应用后清零，避免每 tick 重复触发。
+- **验收**：`M7_COLLECT_WOOD_OK steps=202 progress=1.00`（env.reset/step 端到端 + 脚本策略挖 4 原木，reward=10.0 来自服务端）；obs pov(224,224,3)+player.pos；step 返回类型断言通过。
+- **踩坑**：① 旧客户端进程 cmdline 含 `fabric.dli.config`（非 `net.minecraft.client.main.Main`），pkill 模式不匹配 → 僵尸占 30001 → 新客户端 WS BindException，需按 fabric 特征杀进程；② 修复后需重建 jar 并**重启整个客户端**才生效。
+
 ### 13.6 Phase 3：数据对齐与性能优化（最关键）
 
 **目标**：tick/frame 严格对齐、抓帧 <1ms、多 env 并行稳定。
@@ -832,7 +843,7 @@ M0 ─► M1 ─┬─► M2 ─► M3 ──┬──────────�
 | M4 | 世界引擎 | P2 | M1 | 2.3-2.4 | 两次 reset 体素一致；玩家态/背包/时间/实体正确重置 | ✅ |
 | M5 | 任务系统 | P2 | M4 | 2.5 | `collect_wood` 判定 success=true；reward 来自服务端事件 | ✅ |
 | M6 | 状态与寻路 | P2 | M4 | 2.6 | `GetVoxels` 与实景一致；`ComputePath` 输出可达航点 | ✅ |
-| M7 | Env 闭环 | P2 | M2, M3, M5, M6 | 2.7 | `env.reset/step` 端到端跑通 `collect_wood`（随机/脚本策略） | ⬜ |
+| M7 | Env 闭环 | P2 | M2, M3, M5, M6 | 2.7 | `env.reset/step` 端到端跑通 `collect_wood`（随机/脚本策略） | ✅ |
 | M8 | 数据对齐 | P3 | M7 | 3.1 | 10 episode 帧/状态/动作/奖励计数一致 + tick 断言 100% | ⬜ |
 | M9 | 性能与并行 | P3 | M8 | 3.2-3.3 | 抓帧 <1ms；4 env 并行稳定 ≥1h | ⬜ |
 | M10 | 数据管线 | P3+P4 | M8, M9 | 3.4, 4.2 | 首份可验证数据集 + WDS/HF/RLDS 导出冒烟 | ⬜ |
@@ -944,7 +955,7 @@ fake-mc/
 ### 里程碑
 
 > 里程碑骨架（M0-M12：ID/阶段/依赖/任务/Exit/状态 + DAG）见 **§13.10**。
-> 当前状态（2026-08-06）：**M0/M1/M2/M3/M4/M5/M6 全部 ✅**（记录见 §13.3-13.5）；剩 **M7（Env 闭环）**、**M8（数据对齐）**。
+> 当前状态（2026-08-06）：**M0-M7 全部 ✅**（记录见 §13.3-13.5）；剩 **M8（数据对齐）**。
 
 ---
 

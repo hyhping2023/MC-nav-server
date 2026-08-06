@@ -1,20 +1,19 @@
-"""原始动作与语义动作的映射桩（M0 里程碑）。
+"""原始动作映射（M0 骨架 + M7 Env 闭环实现）。
 
-职责：DESIGN.md §7 定义的动作空间三层映射：
+职责：DESIGN.md §7 定义的原始动作（tick 级，MineRL/VPT 对齐）映射：
 
-- 原始动作（tick 级，MineRL/VPT 对齐）：buttons（forward/back/left/right/jump/
-  sneak/sprint/attack/use/drop/inventory + hotbar 0-8）+ camera **121 bin（11×11）**；
-- VPT 离散 token（可选，§7.2）：buttons 分层组合为单个离散 token；
-- 语义动作（§7.3，与 Mineflayer 命名对齐）：goto / dig / place / craft / equip /
-  attack_entity / use_block / eat…，以 ``action_id`` 异步执行，双标签记录。
+- buttons（forward/back/left/right/jump/sneak/sprint/attack/use/drop/inventory）
+  + hotbar 0-8 + camera [pitch_delta, yaw_delta]（度）。
+- `random_action()`：随机按键 + camera 增量 + hotbar（随机策略/冒烟用）。
+- `to_ws(action)`：动作 dict → WS 下行 `{"cmd":"action", ...}`（M2 客户端执行）。
 
-M0 仅定义常量与转换接口，不实现具体映射逻辑。
-依赖里程碑：M2（客户端动作注入）——`to_ws` 输出发给 client_ws；
-M5（任务系统）——语义动作经服务端分解/判定。
+注意：客户端 ActionCmd#fromJson 用 Gson `getAsBoolean()` 解析按键，整数
+`1` 会被解析为 false（`parseBoolean("1")`），因此 `to_ws` 必须输出真布尔值。
 """
 
 from __future__ import annotations
 
+import random
 from typing import Any, Dict
 
 # camera 121 bin（11×11），对齐 MineRL/MineDojo/MineStudio（DESIGN.md §7.1）。
@@ -50,36 +49,65 @@ SEMANTIC_ACTIONS = (
     "eat",
 )
 
+# camera 增量范围（度/步，M2 客户端 setPitch/setYaw 增量应用）。
+CAMERA_DELTA_MAX = 30.0
+
+
+def random_action(rng: Any = None) -> Dict[str, Any]:
+    """随机原始动作：随机按键 + camera 增量 + hotbar。
+
+    返回动作 dict（键为 BUTTONS + hotbar + camera），供 random_agent 与
+    gymnasium 随机策略使用。
+    """
+    rng = rng or random
+    action: Dict[str, Any] = {
+        button: bool(rng.choice([0, 1])) for button in BUTTONS
+    }
+    action["hotbar"] = int(rng.randrange(0, 9))
+    action["camera"] = [
+        float(rng.uniform(-CAMERA_DELTA_MAX, CAMERA_DELTA_MAX)),
+        float(rng.uniform(-CAMERA_DELTA_MAX, CAMERA_DELTA_MAX)),
+    ]
+    return action
+
+
+def to_ws(action: Dict[str, Any]) -> Dict[str, Any]:
+    """原始动作 dict → WS 下行消息（客户端 ActionCmd 可执行）。
+
+    按键转真布尔（见模块 docstring 的 getAsBoolean 坑）；hotbar/camera 数值透传。
+    缺省按键视为 False，缺省 hotbar 不切换（-1）。
+    """
+    msg: Dict[str, Any] = {"cmd": "action"}
+    for button in BUTTONS:
+        msg[button] = bool(action.get(button, False))
+    hotbar = action.get("hotbar")
+    if hotbar is not None:
+        msg["hotbar"] = int(hotbar)
+    cam = action.get("camera")
+    if cam is not None:
+        msg["camera"] = [float(cam[0]), float(cam[1])]
+    return msg
+
 
 class ActionSpace:
-    """原始/语义动作映射接口桩。
-
-    - `to_ws(action) -> dict`：原始动作 dict → WS 下行动作（M2 实现）。
-    - `semantic_to_primitive(semantic) -> list[dict]`：语义动作 → 原始动作序列
-      （M2/M5 实现），轨迹双标签记录。
-    """
+    """原始/语义动作映射接口（M7：random_action / to_ws 已实现）。"""
 
     def __init__(self, mode: str = "discrete", camera_bins: int = CAMERA_BINS) -> None:
         self.mode = mode  # "discrete" | "continuous" | "vpt_token"
         self.camera_bins = camera_bins
 
-    def to_ws(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """原始动作 dict → WS 下行消息（客户端可执行）。
+    def random_action(self) -> Dict[str, Any]:
+        """随机原始动作（委托模块级 random_action）。"""
+        return random_action()
 
-        依赖 M2：client_ws 的 ActionApplier 注入。
-        """
-        raise NotImplementedError("M2 实现：buttons + camera 121 bin 编码为 WS action")
+    def to_ws(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """动作 dict → WS 下行消息（委托模块级 to_ws）。"""
+        return to_ws(action)
 
     def semantic_to_primitive(self, semantic: Dict[str, Any]) -> list:
-        """语义动作 → 原始动作序列。
-
-        依赖 M2 + M5：goto→ComputePath→逐航点；craft→合成 UI 操作序列。
-        """
-        raise NotImplementedError("M2 实现：语义动作分解为原始动作序列")
+        """语义动作 → 原始动作序列（M12 实现）。"""
+        raise NotImplementedError("M12 实现：语义动作分解为原始动作序列")
 
     def vpt_token(self, action: Dict[str, Any]) -> int:
-        """VPT 离散 token 编码（可选模式，§7.2）。
-
-        依赖 M2：与 STEVE-1 / VPT 预训练对齐的单 token 输出。
-        """
-        raise NotImplementedError("M2 实现：VPT 分层 token 编码")
+        """VPT 离散 token 编码（可选模式，§7.2；M12 实现）。"""
+        raise NotImplementedError("M12 实现：VPT 分层 token 编码")

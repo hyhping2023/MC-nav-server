@@ -3,6 +3,7 @@ package dev.vla.client;
 import dev.vla.client.gfx.FrameGrabber;
 import dev.vla.client.input.ActionApplier;
 import dev.vla.client.input.ActionCmd;
+import dev.vla.client.mixin.MinecraftClientAccessor;
 import dev.vla.client.net.FrameSender;
 import dev.vla.client.net.WsServer;
 import net.fabricmc.api.ClientModInitializer;
@@ -11,10 +12,12 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ConnectScreen;
+import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.Session;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,6 +25,9 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -60,6 +66,9 @@ public final class VlaClient implements ClientModInitializer {
 
     private volatile boolean apiMode = false;
 
+    /** M7.1：切到 API 模式前的 pauseOnLostFocus 原值（退出时恢复）。 */
+    private boolean savedPauseOnLostFocus = true;
+
     /** M3：帧队列（渲染线程只入队，FrameSender 后台线程消费编码+上行）。 */
     private final ConcurrentLinkedQueue<FrameGrabber.FrameData> frameQueue = new ConcurrentLinkedQueue<>();
 
@@ -83,7 +92,23 @@ public final class VlaClient implements ClientModInitializer {
         wsServer = new WsServer(WS_PORT, new WsServer.WsHandler() {
             @Override
             public void onModeChange(String mode) {
-                apiMode = API_MODE.equals(mode);
+                boolean newApi = API_MODE.equals(mode);
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null && client.options != null) {
+                    client.execute(() -> {
+                        if (newApi && !apiMode) {
+                            // M7.1：API 模式不抓鼠标、失焦不弹暂停菜单
+                            savedPauseOnLostFocus = client.options.pauseOnLostFocus;
+                            client.options.pauseOnLostFocus = false;
+                            if (client.mouse.isCursorLocked()) {
+                                client.mouse.unlockCursor();
+                            }
+                        } else if (!newApi && apiMode) {
+                            client.options.pauseOnLostFocus = savedPauseOnLostFocus;
+                        }
+                    });
+                }
+                apiMode = newApi;
                 LOGGER.info("[vla-client] WS mode -> {} (apiMode={})", mode, apiMode);
                 unpressAllKeys(); // 防粘键
                 if (!apiMode) {
@@ -149,15 +174,24 @@ public final class VlaClient implements ClientModInitializer {
         WorldRenderEvents.LAST.register(ctx -> frameGrabber.capture());
     }
 
-    /** M3：若 run/autojoin.txt 存在（内容 host:port），主菜单就绪后编程式加入。 */
+    /**
+     * M3+M7：若 run/autojoin.txt 存在（两行：行1 host:port，行2 用户名），主菜单就绪后
+     * 先用行2 覆盖 session 用户名（agent0 固定身份，Accessor Mixin），再编程式加入。
+     */
     private void registerAutoJoin() {
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
-            String target = readAutoJoinTarget(client);
-            if (target == null) {
+            String[] autoJoin = readAutoJoin(client);
+            if (autoJoin == null) {
                 return;
             }
             if (!autoJoinAttempted.compareAndSet(false, true)) {
                 return;
+            }
+
+            String target = autoJoin[0];
+            String username = autoJoin[1];
+            if (username != null && !username.isEmpty()) {
+                applySessionUsername(client, username);
             }
 
             String host = target;
@@ -183,8 +217,33 @@ public final class VlaClient implements ClientModInitializer {
         });
     }
 
-    /** 读取 autojoin 目标（优先 client.runDirectory 下的 autojoin.txt）。 */
-    private String readAutoJoinTarget(MinecraftClient client) {
+    /**
+     * M7：入服前用 Accessor 覆盖客户端 session 用户名（agent0 固定身份）。
+     *
+     * <p>UUID 用服务端离线映射 {@code UUID.nameUUIDFromBytes("OfflinePlayer:"+name)}
+     * 保持一致；offline 模式（online-mode=false）下服务端不校验 accessToken。
+     * Session 构造签名 genSources 核实（1.20.1 Yarn）：
+     * {@code Session(String username, String uuid, String accessToken,
+     * Optional<String> xuid, Optional<String> clientId, AccountType accountType)}。
+     */
+    private void applySessionUsername(MinecraftClient client, String username) {
+        try {
+            UUID uuid = UUID.nameUUIDFromBytes(
+                    ("OfflinePlayer:" + username).getBytes(StandardCharsets.UTF_8));
+            Session session = new Session(username, uuid.toString(), "token",
+                    Optional.empty(), Optional.empty(), Session.AccountType.LEGACY);
+            ((MinecraftClientAccessor) client).setSession(session);
+            LOGGER.info("[vla-client] session username -> {} (offlineUuid={})", username, uuid);
+        } catch (Exception e) {
+            LOGGER.error("[vla-client] failed to override session username to " + username, e);
+        }
+    }
+
+    /**
+     * 读取 autojoin 配置（优先 client.runDirectory 下的 autojoin.txt）。
+     * 返回 String[]{hostPort, username}；两行任一为空则对应字段为空串；无文件返回 null。
+     */
+    private String[] readAutoJoin(MinecraftClient client) {
         File[] candidates = {
                 new File(client.runDirectory, "autojoin.txt"),
                 new File("autojoin.txt"),
@@ -193,8 +252,16 @@ public final class VlaClient implements ClientModInitializer {
         for (File file : candidates) {
             if (file.isFile()) {
                 try {
-                    String content = Files.readString(file.toPath(), StandardCharsets.UTF_8).trim();
-                    return content.isEmpty() ? null : content;
+                    List<String> lines = Files.readAllLines(file.toPath(), StandardCharsets.UTF_8);
+                    if (lines.isEmpty()) {
+                        return null;
+                    }
+                    String hostPort = lines.get(0).trim();
+                    String username = lines.size() > 1 ? lines.get(1).trim() : "";
+                    if (hostPort.isEmpty()) {
+                        return null;
+                    }
+                    return new String[]{hostPort, username};
                 } catch (IOException e) {
                     LOGGER.warn("[vla-client] failed to read autojoin.txt: {}", e.getMessage());
                     return null;
@@ -205,16 +272,28 @@ public final class VlaClient implements ClientModInitializer {
     }
 
     /**
-     * 每 tick 末尾：先释放上一 tick 注入的按键（防粘键），再把动作交给 ActionApplier 注入。
-     * 动作按 tick 消费（getAndSet(null)），保证 camera 增量只作用一次、无动作时移动归零。
+     * 每 tick 末尾：先释放上一 tick 注入的按键（防粘键），再把最近动作注入。
+     *
+     * <p>M7.1（电平保持）：动作**不按 tick 消费**——`currentAction` 持续持有最近一次
+     * WS 动作，直到被新动作替换。原因：env.step 跨多个游戏 tick（gRPC 阻塞 2 ticks +
+     * 收帧 + Python 开销 ≈ 5-10 ticks），若每 tick 消费置空，forward/attack 占空比极低，
+     * 玩家只能蠕动、挖掘进度永远攒不满。电平保持让"发一次动作 → 按住直到下一条替换"，
+     * 匹配 VLA step 语义。一次性字段（camera 增量 / hotbar / drop / inventory）由
+     * {@link ActionApplier#apply} 应用一次后清零，避免每 tick 重复触发。
      */
     private void registerTickHandler() {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            // M7：API_MODE 下窗口失焦会自动打开暂停菜单（GameMenuScreen），它挡住
+            // handleInputEvents → 挖掘失效。每 tick 强制关闭（M7.1 已置
+            // pauseOnLostFocus=false 从源头防止，此为兜底）。
+            if (apiMode && client.currentScreen instanceof GameMenuScreen) {
+                client.setScreen(null);
+            }
             if (!apiMode) {
                 return; // HUMAN_MODE 透明
             }
             ActionApplier.resetKeys(client);
-            ActionCmd cmd = currentAction.getAndSet(null);
+            ActionCmd cmd = currentAction.get();   // 电平保持：不消费
             if (cmd != null && client.player != null) {
                 ActionApplier.apply(client, client.player, cmd);
             }
