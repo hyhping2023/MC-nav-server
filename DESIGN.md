@@ -687,6 +687,13 @@ Phase 0（环境/脚手架）
 - 随机策略可驱动移动/转向/攻击，`random_agent.py` 输出帧 `(3,224,224)` 与动作 1:1。
 - 帧上行 ≥20fps，无粘键、无崩溃。
 
+**M2 完成记录（2026-08-06，客户端控制 ✅）**：
+- **`input/ActionCmd.java`**（纯 Java，`fromJson` 无 MC 依赖）、**`input/ActionApplier.java`**（视角 `setYaw/setPitch` 增量 + attack/use/drop/inventory 经 KeyBinding + hotbar 按下-释放）、**`mixin/KeyboardInputMixin.java`**（API 模式 cancel 原 tick，写 movement 字段）、**`mixin/MouseMixin.java`**（API 模式 cancel `Mouse#updateMouse`）。
+- **Yarn 1.20.1 核实**（genSources）：`KeyboardInput#tick(boolean,float)`；`Input` 有 `pressingForward/Back/Left/Right`、`movementForward/Sideways`、`jumping/sneaking`，**无 `sprinting`**（疾跑经 `Entity#setSprinting`）；`Mouse#updateMouse()`；GameOptions 字段是 `dropKey/inventoryKey`（非 keyDrop）；hotbar/drop/inventory 走 `wasPressed()` 需补 `KeyBinding.onKeyPressed`。
+- **WS 扩展**：`action`（→`action_ok`，harness 打印解析回显）、`reset_camera`（→`camera_ok`）；模式切换时 `client.options.allKeys` 全 `unpressAll` 防粘键。
+- **验证**：build ✅；harness 三项全过（action 字段回显一致 / reset_camera / mode）；**`./gradlew runClient` 实机跑通**（loader 0.15.11→0.16.10 以兼容 fabric-api 0.92.11；mixin 零报错、渲染至标题屏、WS 30001 游戏内监听、实机 WS 指令通过）。
+- **遗留**：hotbar/drop/inventory 用 `getDefaultKey()`（用户改键不匹配）；attack 未补 timesPressed → 仅按住挖掘、单发 doAttack 不触发；camera 与 movement 至多 1 tick 相位差（M3 对齐时处理）。物理键鼠隔离为代码路径 + mixin 加载验证，真人目视检查留待 M3。
+
 ### 13.5 Phase 2：Purpur 服务端世界引擎（可与 P1 并行）
 
 **目标**：gRPC + 世界重置 + 任务/奖励 + 体素 + 寻路，Python 端 `reset/step` 闭环。
@@ -805,7 +812,7 @@ M0 ─► M1 ─┬─► M2 ─► M3 ──┬──────────�
 |---|---|---|---|---|---|---|
 | M0 | 环境脚手架 | P0 | — | 0.1-0.5 | 三端可跑：客户端可进服 / `vla_env` import / proto 代码生成 | ✅ |
 | M1 | 通信底座 | P1+P2 | M0 | 1.1, 2.1-2.2 | Python 可 ping 两端：WS `pong` + gRPC 返回 `server_tick` | ✅ |
-| M2 | 客户端控制 | P1 | M1 | 1.2-1.3 | API_MODE 物理键鼠完全失效；HUMAN_MODE 透明；无粘键 | ⬜ |
+| M2 | 客户端控制 | P1 | M1 | 1.2-1.3 | API_MODE 物理键鼠完全失效；HUMAN_MODE 透明；无粘键 | ✅ |
 | M3 | 客户端视觉 | P1 | M1, M2 | 1.4-1.6 | 随机策略驱动移动/转向/攻击；224² 帧 ≥20fps 上行且与动作 1:1 | ⬜ |
 | M4 | 世界引擎 | P2 | M1 | 2.3-2.4 | 两次 reset 体素一致；玩家态/背包/时间/实体正确重置 | ✅ |
 | M5 | 任务系统 | P2 | M4 | 2.5 | `collect_wood` 判定 success=true；reward 来自服务端事件 | ⬜ |
@@ -922,7 +929,7 @@ fake-mc/
 ### 里程碑
 
 > 里程碑骨架（M0-M12：ID/阶段/依赖/任务/Exit/状态 + DAG）见 **§13.10**。
-> 当前状态：**M0 ✅**（§13.3）、**M1 ✅**（§13.5）、**M4 ✅ 已完成**（2026-08-06，验收记录见 §13.5）；M2/M3（客户端）与 M5/M6（服务端）可并行开工。
+> 当前状态：**M0 ✅**（§13.3）、**M1 ✅**、**M2 ✅**（§13.4）、**M4 ✅**（§13.5，均 2026-08-06）；M3（客户端视觉）与 M5/M6（服务端）可并行。
 
 ---
 

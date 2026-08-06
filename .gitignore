@@ -23,3 +23,6 @@ __pycache__/
 
 # tools/ws_harness 下载的依赖 jar（ws_harness.sh 自动补齐）
 /tools/ws_harness/libs/
+
+# CodeBuddy 会话内临时文件（scheduled_tasks 锁等）
+/.codebuddy/

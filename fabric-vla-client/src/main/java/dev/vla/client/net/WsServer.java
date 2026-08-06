@@ -1,9 +1,11 @@
 package dev.vla.client.net;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
+import dev.vla.client.input.ActionCmd;
 import org.java_websocket.WebSocket;
 import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.WebSocketServer;
@@ -32,6 +34,14 @@ public class WsServer extends WebSocketServer {
         void onConnect(String session);
 
         void onDisconnect(String session);
+
+        /** M2：收到原始动作指令（WsServer 不解析 MC 相关语义，仅回调）。 */
+        default void onAction(ActionCmd cmd) {
+        }
+
+        /** M2：收到视角重置指令。 */
+        default void onResetCamera(float yaw, float pitch) {
+        }
     }
 
     public static final String API_MODE = "api";
@@ -126,6 +136,28 @@ public class WsServer extends WebSocketServer {
                 conn.send(GSON.toJson(bye));
                 conn.close();
             }
+            case "action" -> {
+                ActionCmd actionCmd;
+                try {
+                    actionCmd = ActionCmd.fromJson(obj);
+                } catch (Exception e) {
+                    sendError(conn, "invalid action: " + e.getMessage());
+                    break;
+                }
+                handler.onAction(actionCmd);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "action_ok");
+                ok.add("action", actionToJson(actionCmd)); // 回显解析字段，便于验证
+                conn.send(GSON.toJson(ok));
+            }
+            case "reset_camera" -> {
+                float yaw = obj.has("yaw") ? obj.get("yaw").getAsFloat() : 0.0f;
+                float pitch = obj.has("pitch") ? obj.get("pitch").getAsFloat() : 0.0f;
+                handler.onResetCamera(yaw, pitch);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "camera_ok");
+                conn.send(GSON.toJson(ok));
+            }
             default -> sendError(conn, "unknown cmd: " + cmd);
         }
     }
@@ -142,13 +174,64 @@ public class WsServer extends WebSocketServer {
         conn.send(GSON.toJson(err));
     }
 
+    /** 把解析出的动作回显为 JSON（action_ok 附带，供 harness 断言解析结果）。 */
+    private static JsonObject actionToJson(ActionCmd cmd) {
+        JsonObject j = new JsonObject();
+        j.addProperty("forward", cmd.forward);
+        j.addProperty("back", cmd.back);
+        j.addProperty("left", cmd.left);
+        j.addProperty("right", cmd.right);
+        j.addProperty("jump", cmd.jump);
+        j.addProperty("sneak", cmd.sneak);
+        j.addProperty("sprint", cmd.sprint);
+        j.addProperty("attack", cmd.attack);
+        j.addProperty("use", cmd.use);
+        j.addProperty("drop", cmd.drop);
+        j.addProperty("inventory", cmd.inventory);
+        j.addProperty("hotbar", cmd.hotbar);
+        JsonArray cam = new JsonArray();
+        cam.add(cmd.camera[0]);
+        cam.add(cmd.camera[1]);
+        j.add("camera", cam);
+        return j;
+    }
+
     /**
      * 独立测试入口：`java -cp ... dev.vla.client.net.WsServer [port]`。
-     * 启动后打印 {@code WS_HARNESS_READY port=<port>} 并保持运行。
+     * 启动后打印 {@code WS_HARNESS_READY port=<port>} 并保持运行；
+     * onAction/onResetCamera 打印解析结果，供 harness 验证。
      */
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : DEFAULT_PORT;
-        WsServer server = new WsServer(port);
+        WsServer server = new WsServer(port, new WsHandler() {
+            @Override
+            public void onModeChange(String mode) {
+            }
+
+            @Override
+            public void onConnect(String session) {
+            }
+
+            @Override
+            public void onDisconnect(String session) {
+            }
+
+            @Override
+            public void onAction(ActionCmd cmd) {
+                System.out.println("ACTION parsed: forward=" + cmd.forward + " back=" + cmd.back
+                        + " left=" + cmd.left + " right=" + cmd.right + " jump=" + cmd.jump
+                        + " sneak=" + cmd.sneak + " sprint=" + cmd.sprint + " attack=" + cmd.attack
+                        + " use=" + cmd.use + " drop=" + cmd.drop + " inventory=" + cmd.inventory
+                        + " hotbar=" + cmd.hotbar + " camera=[" + cmd.camera[0] + "," + cmd.camera[1] + "]");
+                System.out.flush();
+            }
+
+            @Override
+            public void onResetCamera(float yaw, float pitch) {
+                System.out.println("RESET_CAMERA yaw=" + yaw + " pitch=" + pitch);
+                System.out.flush();
+            }
+        });
         server.start();
         System.out.println("WS_HARNESS_READY port=" + port);
         System.out.flush();

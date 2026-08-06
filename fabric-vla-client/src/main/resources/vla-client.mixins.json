@@ -2,7 +2,10 @@
   "required": true,
   "package": "dev.vla.client.mixin",
   "compatibilityLevel": "JAVA_17",
-  "mixins": [],
+  "client": [
+    "KeyboardInputMixin",
+    "MouseMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   }
