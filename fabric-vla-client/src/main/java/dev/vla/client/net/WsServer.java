@@ -23,6 +23,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * 协议（P→C 下行 / C→P 上行，见 docs/p1_protocol.md）：
  * - ping → {"type":"pong","ts":<epoch_ms>,"api_mode":<bool>}
  * - {"cmd":"mode","mode":"api"|"human"} → 回调 onModeChange + {"type":"mode_ok","mode":...}
+ * - {"cmd":"set_capture_ui","hud":true|false} → 回调 onSetCaptureUi + {"type":"capture_ui_ok","hud":...}
+ * - {"cmd":"set_turn_speed","deg":40.0} → 回调 onSetTurnSpeed + {"type":"turn_speed_ok","deg":...}
  * - {"cmd":"disconnect"} → {"type":"bye"} + 关闭会话
  * - 未知 cmd / 非法 JSON / 非法 mode → {"type":"error","message":...}
  */
@@ -50,6 +52,14 @@ public class WsServer extends WebSocketServer {
 
         /** M7.3：客户端用自身眼位计算到世界坐标的精确朝向（消除服务端 pos 滞后的瞄准偏差）。 */
         default void onLookAt(double x, double y, double z) {
+        }
+
+        /** M9.1：切换 HUD 抓帧（true = GameRenderer.render TAIL 抓含 HUD/手/准星的完整画面；false = 默认纯净画面）。 */
+        default void onSetCaptureUi(boolean hud) {
+        }
+
+        /** M9.1：覆盖平滑视角每 tick 最大转角（deg/tick，默认 40.0）。 */
+        default void onSetTurnSpeed(double degPerTick) {
         }
     }
 
@@ -204,6 +214,22 @@ public class WsServer extends WebSocketServer {
                 ok.addProperty("x", x);
                 ok.addProperty("y", y);
                 ok.addProperty("z", z);
+                conn.send(GSON.toJson(ok));
+            }
+            case "set_capture_ui" -> {
+                boolean hud = obj.has("hud") && obj.get("hud").getAsBoolean();
+                handler.onSetCaptureUi(hud);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "capture_ui_ok");
+                ok.addProperty("hud", hud);
+                conn.send(GSON.toJson(ok));
+            }
+            case "set_turn_speed" -> {
+                double deg = obj.has("deg") ? obj.get("deg").getAsDouble() : 40.0;
+                handler.onSetTurnSpeed(deg);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "turn_speed_ok");
+                ok.addProperty("deg", deg);
                 conn.send(GSON.toJson(ok));
             }
             default -> sendError(conn, "unknown cmd: " + cmd);

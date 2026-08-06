@@ -6,7 +6,8 @@
     "KeyboardInputMixin",
     "MouseMixin",
     "MinecraftClientAccessor",
-    "MinecraftClientMixin"
+    "MinecraftClientMixin",
+    "GameRendererMixin"
   ],
   "injectors": {
     "defaultRequire": 1

@@ -43,12 +43,15 @@ DIG_SCAN_EVERY = 12        # attack 期间每隔 N 步确认目标是否还在
 MAX_DIG_TRY = 90           # 同一目标连续挖 N 步未破坏则放弃
 APPROACH_RESCAN = 5        # approach 期间每隔 N 步重扫（检测转为 attack）
 STUCK_STEPS = 20           # 位置基本不动 N 步 → 卡死
+APPROACH_STUCK_STEPS = 6   # approach 朝当前航点连续 N 步几乎没动 → 重算路径
+STUCK_MOVED = 0.02         # 水平位移 < 此值视为"没动"
 WP_ARRIVE_DIST = 1.5       # 距航点 < 此值视为到达
 JUMP_Y_THRESH = 0.5        # 下一航点 y 高于玩家此值 → 跳跃（翻 1 格台阶）
 
 
-def log(*a) -> None:
-    print(*a, flush=True)
+def log(*a, **kw) -> None:
+    """打印并立即 flush；支持 print 的 kwargs（如 file=sys.stderr）。"""
+    print(*a, flush=True, **kw)
 
 
 def parse_args() -> argparse.Namespace:
@@ -168,6 +171,8 @@ def collect_wood_policy(
     wander_yaw = 0.0
     wander_jump = 0
     stuck_count = 0
+    wp_stuck = 0            # approach 朝当前航点连续不动步数
+    target_fails: Dict[Tuple[int, int, int], int] = {}   # 同一目标 approach 卡死次数
     last_pos: Optional[Tuple[float, float, float]] = None
     max_progress = 0.0
     logs_found = 0
@@ -189,6 +194,7 @@ def collect_wood_policy(
             reposition -= 1
             mode, target = "none", None
             waypoints, wp = [], None
+            wp_stuck = 0
             action = {"back": True, "camera": [0.0, 0.0]}
 
         # ---- 2) 游走 ----
@@ -215,6 +221,7 @@ def collect_wood_policy(
                     reposition = 2
                     mode, target = "none", None
                     waypoints, wp = [], None
+                    wp_stuck = 0
                     aim_cache = None
                     action = {"camera": [0.0, 0.0]}
                 else:
@@ -228,6 +235,7 @@ def collect_wood_policy(
                 wander_yaw = float(state["player"].get("yaw", 0.0)) + 90.0
                 mode, target = "none", None
                 waypoints, wp = [], None
+                wp_stuck = 0
                 aim_cache = None
                 action = {"camera": [0.0, 0.0]}
             elif settle_steps < SETTLE_STEPS:
@@ -262,6 +270,7 @@ def collect_wood_policy(
                     mode, target = "attack", new_target
                     settle_steps, dig_try = 0, 0
                     aim_cache = None
+                    wp_stuck = 0
                     bx, by, bz = target
                     env.ws.send({"cmd": "look_at", "x": bx + 0.5, "y": by + 0.5, "z": bz + 0.5})
                     settle_steps = 1
@@ -272,6 +281,7 @@ def collect_wood_policy(
                     reposition = 2
                     mode, target = "none", None
                     waypoints, wp = [], None
+                    wp_stuck = 0
                     action = {"camera": [0.0, 0.0]}
                 # 否则保持当前 approach 目标
 
@@ -291,6 +301,7 @@ def collect_wood_policy(
                             wander_yaw = float(state["player"].get("yaw", 0.0)) + 90.0
                             mode, target = "none", None
                             waypoints, wp = [], None
+                            wp_stuck = 0
                             action = {"forward": True, "camera": [0.0, 0.0]}
                     wp = waypoints.pop(0)
                 wx, wy, wz = wp
@@ -301,6 +312,35 @@ def collect_wood_policy(
                 action = {"forward": True, "jump": jump, "camera": [0.0, 0.0]}
                 if dist3(px, py, pz, wx, wy, wz) < WP_ARRIVE_DIST:
                     wp = None  # 到达 → 取下一航点（下个循环）
+
+                # 航点卡死：朝当前航点连续 APPROACH_STUCK_STEPS 步几乎没动。
+                # 首次：后退 3 步解卡（撞墙/贴树干时远离障碍）；同一目标二次卡死：
+                # 黑名单 + 游走换树（防对不可达目标无限重试）。
+                if wp is not None:
+                    if moved < STUCK_MOVED:
+                        wp_stuck += 1
+                    else:
+                        wp_stuck = 0
+                else:
+                    wp_stuck = 0
+
+                if wp_stuck >= APPROACH_STUCK_STEPS:
+                    wp_stuck = 0
+                    waypoints, wp = [], None
+                    action = {"camera": [0.0, 0.0]}
+                    fails = target_fails.get(target, 0) + 1
+                    target_fails[target] = fails
+                    if fails >= 2:
+                        log(f"  [approach] target {target} 卡死 {fails} 次，黑名单+游走")
+                        failed_targets[target] = step + 60
+                        wander_left = WANDER_STEPS + 6
+                        wander_jump = 6
+                        wander_yaw = float(state["player"].get("yaw", 0.0)) + 90.0
+                        mode, target = "none", None
+                    else:
+                        log(f"  [approach] stuck {APPROACH_STUCK_STEPS} 步→后退解卡")
+                        reposition = 3
+                        mode, target = "none", None
 
         # ---- 5) 无目标：重扫/选择 ----
         else:
@@ -317,6 +357,7 @@ def collect_wood_policy(
                 log(f"  [explore] no logs in voxels, wander {WANDER_STEPS} steps")
             else:
                 mode, target = new_mode, new_target
+                wp_stuck = 0
                 bx, by, bz = target
                 dist = dist3(px, py, pz, bx + 0.5, by + 0.5, bz + 0.5)
                 if mode == "attack":
@@ -364,6 +405,7 @@ def collect_wood_policy(
             wander_yaw = float(state["player"].get("yaw", 0.0)) + 90.0
             mode, target = "none", None
             waypoints, wp = [], None
+            wp_stuck = 0
             aim_cache = None
             stuck_count = 0
 

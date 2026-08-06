@@ -57,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--player", default="agent0")
     p.add_argument("--capture", default="native",
                    help="抓帧分辨率：native=游戏原始分辨率（保真+保留比例，推荐）或 WxH 如 1280x720")
+    p.add_argument("--no-hud", action="store_true",
+                   help="关闭 HUD 抓帧（默认开启：demo 视频含物品栏/血条/手/准星；"
+                        "VLA 观测请用 --no-hud 保持纯净画面）")
     return p.parse_args()
 
 
@@ -87,6 +90,11 @@ def main() -> int:
             w, h = (int(x) for x in args.capture.lower().split("x"))
             env.ws.send({"cmd": "set_capture", "width": w, "height": h})
         time.sleep(0.5)  # 等客户端渲染线程重建 FBO
+
+        # M9.1：demo 视频需要完整 UI（HUD+手+准星）——切到 GameRenderer TAIL 抓帧；
+        # 与 set_capture native 兼容（HUD 抓帧独立于分辨率）。
+        env.ws.send({"cmd": "set_capture_ui", "hud": not args.no_hud})
+        time.sleep(0.3)
 
         # 录帧线程（消费全部 WS 帧；主线程只发动作/调 gRPC，不读 WS）
         stop_flag = threading.Event()

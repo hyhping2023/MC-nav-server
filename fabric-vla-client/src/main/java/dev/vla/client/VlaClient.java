@@ -17,11 +17,13 @@ import net.minecraft.client.gui.screen.ConnectScreen;
 import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.Session;
 import net.minecraft.network.PacketByteBuf;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
@@ -82,6 +84,22 @@ public final class VlaClient implements ClientModInitializer {
     /** M8：最近一次经 vla:tick 插件消息收到的服务端权威 tick（网络线程写入、渲染线程读取）。
      *  -1 表示尚未收到任何广播（帧打标时回退 0）。 */
     private static volatile long lastServerTick = -1;
+
+    /**
+     * M9.1：HUD 抓帧开关（默认 false）。false = WorldRenderEvents.LAST 抓纯净画面
+     * （世界+实体渲染完、HUD 前，VLA 观测默认）；true = GameRenderer.render TAIL 抓
+     * 含手+HUD+准星的完整画面（demo 录制需要完整 UI）。两个钩子互斥，同一时刻只有一个抓帧。
+     */
+    private volatile boolean captureUi = false;
+
+    /** M9.1：平滑视角每 tick 最大转角（deg/tick，DESIGN.md §5.3；WS set_turn_speed 可覆盖）。 */
+    private static final double MAX_TURN_DEG = 40.0;
+    private volatile double maxTurnDeg = MAX_TURN_DEG;
+
+    /** M9.1：视角插值目标（look_at/reset_camera 只更新目标，END_CLIENT_TICK 每 tick 平滑转向）。 */
+    private volatile double targetYaw = 0.0;
+    private volatile double targetPitch = 0.0;
+    private volatile boolean cameraTargetActive = false;
 
     /** M3：帧队列（渲染线程只入队，FrameSender 后台线程消费编码+上行）。 */
     private final ConcurrentLinkedQueue<FrameGrabber.FrameData> frameQueue = new ConcurrentLinkedQueue<>();
@@ -164,14 +182,26 @@ public final class VlaClient implements ClientModInitializer {
                 LOGGER.info("[vla-client] WS reset_camera yaw={} pitch={}", yaw, pitch);
                 MinecraftClient client = MinecraftClient.getInstance();
                 if (client != null && client.player != null) {
-                    // setYaw/setPitch 必须在客户端线程执行
+                    // M9.1：不再瞬间 setYaw/setPitch（画面瞬移），只设置插值目标，
+                    // 由 END_CLIENT_TICK 每 tick 平滑转向（DESIGN.md §5.3）。
                     client.execute(() -> {
                         if (client.player != null) {
-                            client.player.setYaw(yaw);
-                            client.player.setPitch(pitch);
+                            setCameraTarget(yaw, pitch);
                         }
                     });
                 }
+            }
+
+            @Override
+            public void onSetCaptureUi(boolean hud) {
+                LOGGER.info("[vla-client] WS set_capture_ui hud={}", hud);
+                captureUi = hud;
+            }
+
+            @Override
+            public void onSetTurnSpeed(double degPerTick) {
+                LOGGER.info("[vla-client] WS set_turn_speed deg={}", degPerTick);
+                maxTurnDeg = degPerTick;
             }
 
             @Override
@@ -202,9 +232,9 @@ public final class VlaClient implements ClientModInitializer {
                         double dy = y - eye.y;
                         double dz = z - eye.z;
                         double h = Math.sqrt(dx * dx + dz * dz);
-                        client.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
-                        client.player.setPitch(h > 1e-6
-                                ? (float) Math.toDegrees(Math.atan2(-dy, h)) : 0.0f);
+                        // M9.1：只更新插值目标（平滑转向），由 END_CLIENT_TICK 收敛；目标值精确 → 收敛后零误差
+                        setCameraTarget(Math.toDegrees(Math.atan2(-dx, dz)),
+                                h > 1e-6 ? Math.toDegrees(Math.atan2(-dy, h)) : 0.0);
                     });
                 }
             }
@@ -238,8 +268,14 @@ public final class VlaClient implements ClientModInitializer {
         frameSender = new FrameSender(wsServer, frameQueue, FrameGrabber.SIZE, FrameGrabber.SIZE);
         frameSender.start();
 
-        // 世界+实体渲染完后、HUD 前（画面纯净，无准星/血条污染像素观测）
-        WorldRenderEvents.LAST.register(ctx -> frameGrabber.capture());
+        // 世界+实体渲染完后、HUD 前（画面纯净，无准星/血条污染像素观测）。
+        // M9.1：captureUi=true 时改由 GameRendererMixin（GameRenderer.render TAIL）抓
+        // 含 HUD 的完整画面，此处加守卫避免两个钩子同时抓帧。
+        WorldRenderEvents.LAST.register(ctx -> {
+            if (!VlaClient.isCaptureUi()) {
+                frameGrabber.capture();
+            }
+        });
     }
 
     /**
@@ -365,6 +401,10 @@ public final class VlaClient implements ClientModInitializer {
             if (cmd != null && client.player != null) {
                 ActionApplier.apply(client, client.player, cmd);
             }
+            // M9.1：平滑视角插值（look_at/reset_camera 目标，DESIGN.md §5.3）
+            if (client.player != null) {
+                interpolateCamera(client.player);
+            }
         });
     }
 
@@ -384,6 +424,42 @@ public final class VlaClient implements ClientModInitializer {
         }
     }
 
+    /** M9.1：设置视角插值目标（客户端线程调用）；pitch 夹紧 ±90（原版范围）。 */
+    private void setCameraTarget(double yaw, double pitch) {
+        targetYaw = yaw;
+        targetPitch = MathHelper.clamp(pitch, -90.0, 90.0);
+        cameraTargetActive = true;
+    }
+
+    /**
+     * M9.1：每 tick 向视角目标插值（DESIGN.md §5.3 平滑转向，消除 setYaw/setPitch 瞬移闪现）。
+     *
+     * <p>yaw 走最短角差（{@link MathHelper#wrapDegrees(double)} 归一化到 [-180,180]），
+     * 每 tick 限幅 maxTurnDeg（默认 40.0，WS set_turn_speed 可覆盖）；pitch 同样限幅且
+     * 夹紧 ±90。误差 <0.05° 时直接置目标并停用插值 —— 瞄准目标固定后收敛即稳定不动
+     * （挖矿期准星稳定），新 look_at/reset_camera 会重新激活。
+     */
+    private void interpolateCamera(ClientPlayerEntity player) {
+        if (!cameraTargetActive) {
+            return;
+        }
+        double curYaw = player.getYaw();
+        double curPitch = player.getPitch();
+        double dYaw = MathHelper.wrapDegrees(targetYaw - curYaw);
+        double dPitch = targetPitch - curPitch;
+        if (Math.abs(dYaw) < 0.05 && Math.abs(dPitch) < 0.05) {
+            player.setYaw((float) targetYaw);
+            player.setPitch((float) targetPitch);
+            cameraTargetActive = false; // 收敛完成，不再动
+            return;
+        }
+        double step = maxTurnDeg;
+        double stepYaw = MathHelper.clamp(dYaw, -step, step);
+        double stepPitch = MathHelper.clamp(dPitch, -step, step);
+        player.setYaw((float) (curYaw + stepYaw));
+        player.setPitch((float) MathHelper.clamp(curPitch + stepPitch, -90.0, 90.0));
+    }
+
     /** 防粘键：模式切换时清空全部按键按下状态。 */
     private void unpressAllKeys() {
         MinecraftClient client = MinecraftClient.getInstance();
@@ -397,6 +473,19 @@ public final class VlaClient implements ClientModInitializer {
 
     public static boolean isApiMode() {
         return INSTANCE != null && INSTANCE.apiMode;
+    }
+
+    /** M9.1：HUD 抓帧开关（WorldRenderEvents.LAST 守卫 / GameRendererMixin 判断用）。 */
+    public static boolean isCaptureUi() {
+        return INSTANCE != null && INSTANCE.captureUi;
+    }
+
+    /** M9.1：HUD 抓帧入口（GameRendererMixin 的 GameRenderer.render TAIL 调用）；
+     * 仅 captureUi=true 时抓帧（含手+HUD+准星的完整画面）。渲染线程调用。 */
+    public static void captureFrameIfUi() {
+        if (INSTANCE != null && INSTANCE.captureUi && INSTANCE.frameGrabber != null) {
+            INSTANCE.frameGrabber.capture();
+        }
     }
 
     public static ActionCmd getCurrentAction() {
