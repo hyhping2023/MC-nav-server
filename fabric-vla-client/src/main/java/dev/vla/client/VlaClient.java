@@ -69,7 +69,11 @@ public final class VlaClient implements ClientModInitializer {
     /** WS 线程写入的原子动作缓冲；每 tick 由 END_CLIENT_TICK 消费。 */
     private static final AtomicReference<ActionCmd> currentAction = new AtomicReference<>();
 
-    private volatile boolean apiMode = false;
+    /**
+     * 默认 API 模式（M7.2 需求：启动即屏蔽键鼠 + 失焦不弹菜单）。
+     * 训练/演示场景无需真人操作，HUMAN_MODE 仅供人类演示采集（WS 切回）。
+     */
+    private volatile boolean apiMode = true;
 
     /** M7.1：切到 API 模式前的 pauseOnLostFocus 原值（退出时恢复）。 */
     private boolean savedPauseOnLostFocus = true;
@@ -96,6 +100,10 @@ public final class VlaClient implements ClientModInitializer {
         registerTickHandler();
         registerFramePipeline();
         registerAutoJoin();
+
+        // M7.2：启动即应用 API 模式 UI（不抓鼠标、失焦不弹菜单）——CLIENT_STARTED 在
+        // 客户端线程触发，此时 MinecraftClient 已可用。
+        ClientLifecycleEvents.CLIENT_STARTED.register(client -> applyApiModeUi(client, true));
     }
 
     /**
@@ -129,19 +137,8 @@ public final class VlaClient implements ClientModInitializer {
             public void onModeChange(String mode) {
                 boolean newApi = API_MODE.equals(mode);
                 MinecraftClient client = MinecraftClient.getInstance();
-                if (client != null && client.options != null) {
-                    client.execute(() -> {
-                        if (newApi && !apiMode) {
-                            // M7.1：API 模式不抓鼠标、失焦不弹暂停菜单
-                            savedPauseOnLostFocus = client.options.pauseOnLostFocus;
-                            client.options.pauseOnLostFocus = false;
-                            if (client.mouse.isCursorLocked()) {
-                                client.mouse.unlockCursor();
-                            }
-                        } else if (!newApi && apiMode) {
-                            client.options.pauseOnLostFocus = savedPauseOnLostFocus;
-                        }
-                    });
+                if (client != null) {
+                    client.execute(() -> applyApiModeUi(client, newApi));
                 }
                 apiMode = newApi;
                 LOGGER.info("[vla-client] WS mode -> {} (apiMode={})", mode, apiMode);
@@ -333,6 +330,22 @@ public final class VlaClient implements ClientModInitializer {
                 ActionApplier.apply(client, client.player, cmd);
             }
         });
+    }
+
+    /** M7.1：API 模式 UI——失焦不弹暂停菜单、释放鼠标捕获；退出恢复原 pauseOnLostFocus。 */
+    private void applyApiModeUi(MinecraftClient client, boolean enable) {
+        if (client == null || client.options == null) {
+            return;
+        }
+        if (enable) {
+            savedPauseOnLostFocus = client.options.pauseOnLostFocus;
+            client.options.pauseOnLostFocus = false;
+            if (client.mouse != null && client.mouse.isCursorLocked()) {
+                client.mouse.unlockCursor();
+            }
+        } else {
+            client.options.pauseOnLostFocus = savedPauseOnLostFocus;
+        }
     }
 
     /** 防粘键：模式切换时清空全部按键按下状态。 */

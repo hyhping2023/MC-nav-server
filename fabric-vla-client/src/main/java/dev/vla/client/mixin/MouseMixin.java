@@ -49,4 +49,11 @@ public abstract class MouseMixin {
             ci.cancel();
         }
     }
+
+    @Inject(method = "onMouseButton", at = @At("HEAD"), cancellable = true)
+    private void vlaApiNoClick(long window, int button, int action, int mods, CallbackInfo ci) {
+        if (VlaClient.isApiMode()) {
+            ci.cancel();
+        }
+    }
 }
