@@ -2,9 +2,9 @@ name: vla-purpur
 version: 0.1.0
 main: dev.vla.purpur.VlaPlugin
 api-version: 1.20
-description: VLA research environment gRPC bridge (M1 comm base)
+description: VLA research environment gRPC bridge (M1 comm base + M4 world engine)
 author: vla
 commands:
   vla:
-    description: VLA env status
-    usage: /vla status
+    description: VLA env status / reset / verify
+    usage: /vla status | /vla reset <player> [halfExtent] | /vla verify <player>

@@ -1,11 +1,14 @@
 package dev.vla.purpur.grpc;
 
 import dev.vla.purpur.VlaPlugin;
+import dev.vla.purpur.reset.ResetEngine;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.util.List;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.entity.Player;
 import vla.Vla;
 import vla.Vla.ClearRequest;
 import vla.Vla.GenerateRequest;
@@ -56,11 +59,54 @@ public class VlaGrpcService extends VlaServerGrpc.VlaServerImplBase {
         responseObserver.onCompleted();
     }
 
-    // ---- M2+ RPC：尚未实现 ----
+    // ---- M2+ RPC：resetWorld 已实现，其余尚未实现 ----
 
     @Override
     public void resetWorld(ResetRequest request, StreamObserver<ResetReply> responseObserver) {
-        unimpl(responseObserver);
+        // 写操作：经 MainThreadDispatcher 调度到 Bukkit 主线程执行（§4.2）
+        MainThreadDispatcher.runSync(() -> {
+            try {
+                Player player = plugin.getAgentManager().resolve(request.getPlayer());
+                if (player == null) {
+                    responseObserver.onError(Status.FAILED_PRECONDITION
+                            .withDescription("player not found: " + request.getPlayer())
+                            .asRuntimeException());
+                    return;
+                }
+                World world = player.getWorld();
+                ResetEngine.ResetSpec spec = new ResetEngine.ResetSpec();
+                boolean explicitRegion = request.getRegionX() != 0
+                        || request.getRegionY() != 0
+                        || request.getRegionZ() != 0;
+                if (explicitRegion) {
+                    spec.setCenter(request.getRegionX(), request.getRegionY(), request.getRegionZ());
+                } else {
+                    Location loc = player.getLocation();
+                    spec.setCenter(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
+                }
+                if (request.getRegionHalfExtent() > 0) {
+                    spec.halfExtent = request.getRegionHalfExtent();
+                }
+
+                ResetEngine.ResetResult result = plugin.getResetEngine().reset(player, spec);
+                plugin.getAgentManager().recordSessionRegion(player, world.getSpawnLocation(),
+                        spec.centerX, spec.centerY, spec.centerZ, spec.halfExtent);
+
+                ResetReply reply = ResetReply.newBuilder()
+                        .setServerTick(result.serverTick)
+                        .setOk(result.ok)
+                        .setMessage(result.checksum)
+                        .build();
+                responseObserver.onNext(reply);
+                responseObserver.onCompleted();
+            } catch (Exception e) {
+                plugin.getLogger().warning("ResetWorld failed: " + e);
+                responseObserver.onError(Status.INTERNAL
+                        .withDescription("reset failed: " + e.getMessage())
+                        .withCause(e)
+                        .asRuntimeException());
+            }
+        });
     }
 
     @Override

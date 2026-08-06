@@ -712,6 +712,17 @@ Phase 0（环境/脚手架）
 - **Python（任务 2.7 前置）**：proto 重生成（新增 Ping RPC）；`ServerGrpc.ping()` / `ClientWs.ping()` 实现；`scripts/ping_both.py` 双端验收 → `M1_PING_BOTH_OK`（WS pong + gRPC `server_tick=104`、`tps=20.21`、`version=git-Purpur-2062`）。
 - **遗留**：`action`/`reset_camera` 指令、**游戏内** WS 接入（需运行完整客户端，harness 已验证协议本身）属 M2；端口占用探测待补。
 
+**M4 完成记录（2026-08-06，世界引擎 ✅）**：
+- **`reset/RegionSnapshot.java`**：BlockData[] 扁平区域快照（capture/restore/CRC32 checksum/blockCount），`World#getBlockState(x,y,z)` 快速读取。
+- **`reset/ResetEngine.java`**：`ResetSpec`（center/halfExtent=16/spawn/clearInventory/initialItems/time=6000）+ **基线缓存**（首次 capture 缓存，后续从缓存恢复保证确定性）；reset 全流程：force-load chunk → 清非玩家实体（含掉落物）→ `Block#setBlockData(data,false)` 回滚 → 玩家态重置（teleport/清背包/HP/饥饿/药水/生存模式）→ gamerule 冻结 → `setTime(6000)+setStorm(false)`；`verify()` 实时校验（checksum/实体数/时间/玩家摘要）。
+- **`player/AgentManager.java`**：离线 UUID 稳定映射（`nameUUIDFromBytes("OfflinePlayer:"+name)`）、join/quit 事件、死亡 2s 自动重生；**跨重连持久区域映射**（mineflayer dig 会踢掉原连接 → session 重建，需持久化 region 否则 C2≠C1）。
+- **`VlaGrpcService`**：实现 `ResetWorld` RPC（经 MainThreadDispatcher 调度，玩家不存在回 FAILED_PRECONDITION）。
+- **验收**（mineflayer bot + `/summon` 僵尸 + dig 挖 grass）：
+  - C1=`fdd0b795` → summon+dig 后 verify `ef349e33`（≠C1）+ `entities=2` → 二次 reset C2=`fdd0b795` **==C1 ✓**、`entities=0`、`pos==spawn`、`time=6000`、`hp=20/food=20/sat=20`
+  - gRPC `ResetWorld ok=true server_tick=1560`；不存在玩家 → FAILED_PRECONDITION
+- **踩坑记录**：① 本仓库 paper-api 无 `World#setBlockState(...,applyPhysics)`，用 `Block#setBlockData(data,false)`（语义相同）；② **FIFO 控制台命令不带 `/` 前缀**（`vla status` 有效、`/vla status` 报 Unknown command）；③ dig 踢连接→session 重建，region 持久化解决。
+- **遗留**：`vla_env/server_grpc.py::reset_world()` 仍占位（属 M7 Python 集成）；世界留有 dig 痕迹（基线即捕获态，不影响确定性）。
+
 ### 13.6 Phase 3：数据对齐与性能优化（最关键）
 
 **目标**：tick/frame 严格对齐、抓帧 <1ms、多 env 并行稳定。
@@ -796,7 +807,7 @@ M0 ─► M1 ─┬─► M2 ─► M3 ──┬──────────�
 | M1 | 通信底座 | P1+P2 | M0 | 1.1, 2.1-2.2 | Python 可 ping 两端：WS `pong` + gRPC 返回 `server_tick` | ✅ |
 | M2 | 客户端控制 | P1 | M1 | 1.2-1.3 | API_MODE 物理键鼠完全失效；HUMAN_MODE 透明；无粘键 | ⬜ |
 | M3 | 客户端视觉 | P1 | M1, M2 | 1.4-1.6 | 随机策略驱动移动/转向/攻击；224² 帧 ≥20fps 上行且与动作 1:1 | ⬜ |
-| M4 | 世界引擎 | P2 | M1 | 2.3-2.4 | 两次 reset 体素一致；玩家态/背包/时间/实体正确重置 | ⬜ |
+| M4 | 世界引擎 | P2 | M1 | 2.3-2.4 | 两次 reset 体素一致；玩家态/背包/时间/实体正确重置 | ✅ |
 | M5 | 任务系统 | P2 | M4 | 2.5 | `collect_wood` 判定 success=true；reward 来自服务端事件 | ⬜ |
 | M6 | 状态与寻路 | P2 | M4 | 2.6 | `GetVoxels` 与实景一致；`ComputePath` 输出可达航点 | ⬜ |
 | M7 | Env 闭环 | P2 | M2, M3, M5, M6 | 2.7 | `env.reset/step` 端到端跑通 `collect_wood`（随机/脚本策略） | ⬜ |
@@ -911,7 +922,7 @@ fake-mc/
 ### 里程碑
 
 > 里程碑骨架（M0-M12：ID/阶段/依赖/任务/Exit/状态 + DAG）见 **§13.10**。
-> 当前状态：**M0 ✅**（§13.3）、**M1 ✅ 已完成**（2026-08-06，验收记录见 §13.5）；M2/M3（客户端）与 M4/M5/M6（服务端）可并行开工。
+> 当前状态：**M0 ✅**（§13.3）、**M1 ✅**（§13.5）、**M4 ✅ 已完成**（2026-08-06，验收记录见 §13.5）；M2/M3（客户端）与 M5/M6（服务端）可并行开工。
 
 ---
 
