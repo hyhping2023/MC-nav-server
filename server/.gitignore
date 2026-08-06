@@ -1,0 +1,31 @@
+# 运行时下载/生成物
+purpur.jar
+versions/
+libraries/
+cache/
+
+# 世界数据
+world/
+world_nether/
+world_the_end/
+
+# 日志
+logs/
+*.log
+
+# 服务端生成的配置
+config/
+version_history.json
+bukkit.yml
+spigot.yml
+purpur.yml
+pufferfish.yml
+commands.yml
+help.yml
+permissions.yml
+ops.json
+usercache.json
+whitelist.json
+banned-ips.json
+banned-players.json
+plugins/

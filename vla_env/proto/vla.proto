@@ -1,0 +1,178 @@
+// vla.proto — Python（vla_env）↔ Purpur 插件 共享的 gRPC 契约。
+// 对应 DESIGN.md §9.1；服务端写操作一律经 Bukkit 主线程调度（§4.2）。
+syntax = "proto3";
+
+package vla;
+
+// 空消息（无返回的 RPC 统一使用 Void）。
+message Void {}
+
+// ---- 重置 ----
+
+message ResetRequest {
+  string player = 1;
+  string task = 2;
+  int32 seed = 3;
+  // 重置区域（中心 + 半宽），空则用任务默认区域。
+  int32 region_x = 4;
+  int32 region_y = 5;
+  int32 region_z = 6;
+  int32 region_half_extent = 7;
+}
+
+message ResetReply {
+  int32 server_tick = 1;
+  bool ok = 2;
+  string message = 3;
+}
+
+// ---- Step 结算（server-authoritative）----
+
+message StepRequest {
+  string player = 1;
+  // 阻塞等待的服务端 tick 数（默认 4）。
+  int32 await_ticks = 2;
+}
+
+message StepReply {
+  float reward = 1;
+  bool terminated = 2;
+  bool truncated = 3;
+  int32 server_tick = 4;
+  float progress = 5;
+  map<string, string> info = 6;
+}
+
+// ---- 状态 ----
+
+message StateRequest {
+  string player = 1;
+}
+
+message StateReply {
+  // 玩家/背包/统计/罗盘等本地状态，JSON 编码（字段见 DESIGN.md §8）。
+  string json = 1;
+}
+
+// ---- 体素（32³，可选）----
+
+message VoxelRequest {
+  string player = 1;
+  int32 center_x = 2;
+  int32 center_y = 3;
+  int32 center_z = 4;
+  int32 half_extent = 5; // 默认 16 → 32³
+}
+
+message VoxelReply {
+  repeated string palette = 1; // 块 id 表
+  repeated int32 data = 2;     // 按 (x,y,z) 序的局部 palette 索引
+  int32 origin_x = 3;
+  int32 origin_y = 4;
+  int32 origin_z = 5;
+  int32 size = 6;              // 边长
+}
+
+// ---- 路径（A* 航点）----
+
+message PathRequest {
+  string player = 1;
+  Vec3 start = 2;
+  Vec3 goal = 3;
+  string cost_mode = 4; // 可选："default" | "no_jump" | "water"
+}
+
+message PathReply {
+  repeated Vec3 waypoints = 1; // 拐点序列
+  bool found = 2;
+}
+
+message Vec3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+// ---- 任务 ----
+
+message TaskRequest {
+  string player = 1;
+  string task = 2;       // 任务 id（registry）
+  int32 seed = 3;        // 任务/重置种子
+}
+
+message TaskReply {
+  string id = 1;
+  string instruction = 2;
+  string instruction_zh = 3;
+  int32 difficulty = 4;
+  float progress = 5;
+  bool success = 6;
+  int32 timeout_ticks = 7;
+}
+
+message GenerateRequest {
+  string player = 1;
+  string prompt = 2;     // 课程/LLM 生成提示
+  int32 difficulty = 3;
+}
+
+// ---- God Mode 世界控制 ----
+
+message ClearRequest {
+  string player = 1;
+  int32 center_x = 2;
+  int32 center_y = 3;
+  int32 center_z = 4;
+  int32 half_extent = 5; // 清实体/方块区域
+  bool clear_blocks = 6;
+  bool clear_entities = 7;
+}
+
+message TeleportRequest {
+  string player = 1;
+  Vec3 pos = 2;
+  float yaw = 3;
+  float pitch = 4;
+}
+
+message SpawnRequest {
+  string player = 1;
+  string entity_type = 2; // 如 "minecraft:zombie"
+  Vec3 pos = 3;
+  int32 count = 4;
+}
+
+message SetBlockRequest {
+  string player = 1;
+  Vec3 pos = 2;
+  string block = 3; // 如 "minecraft:oak_log"
+  bool apply_physics = 4;
+}
+
+// ---- 服务 ----
+
+service VlaServer {
+  // 重置世界与任务（主线程执行，§4.2）。
+  rpc ResetWorld(ResetRequest) returns (ResetReply);
+  // 阻塞等待 k ticks 后结算 reward/done/progress（server-authoritative）。
+  rpc GetStepResult(StepRequest) returns (StepReply);
+  // 玩家/背包/统计等本地状态。
+  rpc GetState(StateRequest) returns (StateReply);
+  // 32³ 体素矩阵（只读，可 gRPC 线程直读）。
+  rpc GetVoxels(VoxelRequest) returns (VoxelReply);
+  // 3D A* 航点（只读）。
+  rpc ComputePath(PathRequest) returns (PathReply);
+  // 设置任务。
+  rpc SetTask(TaskRequest) returns (TaskReply);
+  // 课程/LLM 生成任务。
+  rpc GenerateTask(GenerateRequest) returns (TaskReply);
+  // 清空区域实体/方块。
+  rpc ClearRegion(ClearRequest) returns (Void);
+  // 传送玩家。
+  rpc Teleport(TeleportRequest) returns (Void);
+  // 生成实体。
+  rpc SpawnEntity(SpawnRequest) returns (Void);
+  // 设置方块（God Mode）。
+  rpc SetBlock(SetBlockRequest) returns (Void);
+}

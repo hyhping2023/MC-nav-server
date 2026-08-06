@@ -7,5 +7,16 @@ __pycache__/
 *.pyc
 *.pyo
 
+# vla_env venv / build artifacts
+/vla_env/.venv/
+/vla_env/*.egg-info/
+
+# Node (tools/agents)
+/tools/agents/node_modules/
+
+# Gradle (fabric-vla-client)
+/fabric-vla-client/.gradle/
+/fabric-vla-client/build/
+
 # OS
 .DS_Store

@@ -1,0 +1,19 @@
+# Gradle
+.gradle/
+build/
+
+# Fabric / run
+run/
+logs/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+
+# Misc
+*.log

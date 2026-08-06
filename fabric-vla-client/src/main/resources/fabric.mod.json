@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "vla-client",
+  "version": "${version}",
+  "name": "vla-client",
+  "description": "VLA controlled Fabric client for the MCPurpur-VLA environment (M0 skeleton).",
+  "authors": [
+    "vla"
+  ],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.vla.client.VlaClient"
+    ]
+  },
+  "mixins": [
+    "vla-client.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": "~1.20.1",
+    "java": ">=17"
+  }
+}

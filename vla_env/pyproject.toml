@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vla-env"
+version = "0.1.0"
+description = "VLA control hub for the Minecraft research environment (Purpur server + Fabric client)"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "grpcio",
+    "grpcio-tools",
+    "websockets",
+    "numpy",
+    "gymnasium",
+    "pillow",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+include = ["vla_env*"]
