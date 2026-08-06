@@ -36,6 +36,11 @@ class VlaServerStub:
         Args:
             channel: A grpc.Channel.
         """
+        self.Ping = channel.unary_unary(
+                '/vla.VlaServer/Ping',
+                request_serializer=vla__pb2.PingRequest.SerializeToString,
+                response_deserializer=vla__pb2.PingReply.FromString,
+                _registered_method=True)
         self.ResetWorld = channel.unary_unary(
                 '/vla.VlaServer/ResetWorld',
                 request_serializer=vla__pb2.ResetRequest.SerializeToString,
@@ -97,6 +102,13 @@ class VlaServerServicer:
     """---- 服务 ----
 
     """
+
+    def Ping(self, request, context):
+        """连通性检查 + 权威 server_tick（M1 通信底座）。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def ResetWorld(self, request, context):
         """重置世界与任务（主线程执行，§4.2）。
@@ -178,6 +190,11 @@ class VlaServerServicer:
 
 def add_VlaServerServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'Ping': grpc.unary_unary_rpc_method_handler(
+                    servicer.Ping,
+                    request_deserializer=vla__pb2.PingRequest.FromString,
+                    response_serializer=vla__pb2.PingReply.SerializeToString,
+            ),
             'ResetWorld': grpc.unary_unary_rpc_method_handler(
                     servicer.ResetWorld,
                     request_deserializer=vla__pb2.ResetRequest.FromString,
@@ -245,6 +262,33 @@ class VlaServer:
     """---- 服务 ----
 
     """
+
+    @staticmethod
+    def Ping(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vla.VlaServer/Ping',
+            vla__pb2.PingRequest.SerializeToString,
+            vla__pb2.PingReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def ResetWorld(request,

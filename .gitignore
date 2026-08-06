@@ -20,3 +20,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# tools/ws_harness 下载的依赖 jar（ws_harness.sh 自动补齐）
+/tools/ws_harness/libs/

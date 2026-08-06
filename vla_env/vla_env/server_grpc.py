@@ -1,36 +1,66 @@
-"""与服务端 gRPC 通信桩（M0 里程碑）。
+"""与服务端 gRPC 通信桩（M0 里程碑 + M1 通信底座）。
 
 职责：Python ↔ Purpur 插件 的 gRPC 通道（DESIGN.md §6.2 / §9.1），
 调用 `vla.proto` 定义的 `VlaServer` 服务：
 
-    ResetWorld / GetStepResult / GetState / GetVoxels / ComputePath /
+    Ping / ResetWorld / GetStepResult / GetState / GetVoxels / ComputePath /
     SetTask / GenerateTask / ClearRegion / Teleport / SpawnEntity / SetBlock
 
 关键约定（§4.2）：服务端写操作一律主线程执行；reward/done 以服务端为权威
 （§14.2），`GetStepResult` 阻塞等待 k ticks 结算。
 
-依赖里程碑：M1（通信底座，gRPC 连接 + 生成 vla_pb2/vla_pb2_grpc）→
-M4（ResetEngine/GetState）→ M5（TaskManager）→ M6（GetVoxels/ComputePath）。
+M1 已实现：`ServerGrpc.ping()` 打通 gRPC Ping RPC（返回 server_tick/tps/
+version/world_name）；其余 RPC 仍为命名占位（raise NotImplementedError），
+随后续里程碑（M4/M5/M6）逐个实现。
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import grpc
+
+from .proto import vla_pb2, vla_pb2_grpc
+
 
 class ServerGrpc:
-    """服务端 gRPC client 桩。方法签名与 proto RPC 一一对应。
+    """服务端 gRPC client。方法签名与 proto RPC 一一对应。
 
-    依赖 M1：grpcio 客户端 + vla_env.proto 生成的 stub。
+    M1：`__init__` 即建立 insecure channel + `VlaServerStub`；
+    `ping()` 调 Ping RPC 返回服务端权威时钟等。
     """
 
-    def __init__(self, address: str = "127.0.0.1:50051", player: str = "agent0") -> None:
-        self.address = address
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 50051,
+        player: str = "agent0",
+    ) -> None:
+        self.address = f"{host}:{port}"
         self.player = player
+        self.channel = grpc.insecure_channel(self.address)
+        self.stub = vla_pb2_grpc.VlaServerStub(self.channel)
 
     def connect(self) -> None:
-        """建立 gRPC 通道 + stub。依赖 M1：grpcio.Channel。"""
-        raise NotImplementedError("M1 实现：grpc 通道 + VlaServerStub")
+        """建立 gRPC 通道 + stub（M1 已随 __init__ 建立，保留兼容入口）。"""
+        # channel 为惰性连接，首个 RPC 时才真正建连；此处仅做连通性预检。
+        self.ping()
+
+    def ping(self) -> Dict[str, Any]:
+        """Ping：连通性检查 + 权威 server_tick（M1 通信底座）。
+
+        返回 dict（对齐 proto PingReply）：server_tick / tps / version /
+        world_name。
+        """
+        reply: vla_pb2.PingReply = self.stub.Ping(
+            vla_pb2.PingRequest(client="vla_env_py")
+        )
+        return {
+            "server_tick": reply.server_tick,
+            "tps": reply.tps,
+            "version": reply.version,
+            "world_name": reply.world_name,
+        }
 
     def reset_world(self, task: Optional[str] = None, seed: Optional[int] = None) -> Dict[str, Any]:
         """ResetWorld：重置世界与任务，返回 ResetReply（含 server_tick）。
@@ -94,5 +124,5 @@ class ServerGrpc:
         raise NotImplementedError("M4 实现：调用 SetBlock RPC")
 
     def close(self) -> None:
-        """关闭 gRPC 通道。依赖 M1。"""
-        raise NotImplementedError("M1 实现：关闭 grpc 通道")
+        """关闭 gRPC 通道（M1 已实现）。"""
+        self.channel.close()

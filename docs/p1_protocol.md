@@ -160,11 +160,43 @@ Python
 - 本文件（任务 0.5「协议文档骨架」交付物之一）为 M0 已完成的唯一产出。
 - 客户端 WS 链路相关交付物（`net/WsServer.java`、`VlaClient.java`、`gfx/FrameGrabber.java`、各 Mixin）**均未开始**。
 
+---
+
+## 6. WS 控制消息实现状态（M1）
+
+> **M1 已实现：WsServer 内置 + 独立 main 测试入口。**
+> 实现位置：`fabric-vla-client/src/main/java/dev/vla/client/net/WsServer.java`（纯 Java，不依赖 Minecraft 类，`public static void main` 可独立运行）；`VlaClient.java` 于 `onInitializeClient` 新开线程启动，监听 `127.0.0.1:30001`（可经系统属性 `vla.ws.port` 覆盖）。独立测试脚本：`tools/ws_harness.sh`。
+
+### 6.1 下行（P→C）已实现 cmd
+
+| cmd | 附加字段 | 响应 | 说明 |
+|---|---|---|---|
+| `ping` | — | `pong` | 心跳；pong 带 `ts`（epoch_ms）与当前 `api_mode` |
+| `mode` | `mode: "api" \| "human"` | `mode_ok`（合法）/ `error`（非法值） | 经 `WsHandler.onModeChange` 回调游戏侧；WsServer 内部同步记录 `api_mode` |
+| `disconnect` | — | `bye` + 关闭会话 | 客户端先回 `bye` 再 `close()` |
+| 未知 cmd / 非法 JSON / 缺 `cmd` | — | `error` | `{"type":"error","message":...}` |
+
+> 未实现（M2+）：`action`、`reset_camera`。
+
+### 6.2 上行（C→P）已实现 type
+
+| type | 字段 | 触发 |
+|---|---|---|
+| `pong` | `ts`（epoch_ms）、`api_mode`（bool） | 收到 `ping` |
+| `mode_ok` | `mode` | 收到合法 `mode` |
+| `error` | `message` | 未知 cmd / 非法 JSON / 非法 mode |
+| `bye` | — | 收到 `disconnect`，随后关闭会话 |
+
+### 6.3 M1 验收
+
+- 独立 harness：`bash tools/ws_harness.sh [port]` → stdout 打印 `WS_HARNESS_READY port=<port>` 并保持运行。
+- 四向断言：`ping→pong`、`mode→mode_ok`、`disconnect→bye`、`bogus→error` 均通过（2026-08-06 实测）。
+
 ### 5.2 随 M1-M3 填充项
 
 | 里程碑 | 任务 | 交付物 | 填充内容 |
 |---|---|---|---|
-| M1 通信底座 | P1.1 | `net/WsServer.java`、`VlaClient.java` | WS 监听 30001、消息 schema（§9.2）、`AtomicReference<ActionCmd> currentAction`、`volatile boolean apiMode`、ping/pong 心跳与断线清理；Exit：WS `pong` 可通 |
+| M1 通信底座 | P1.1 | `net/WsServer.java`、`VlaClient.java` | WS 监听 30001、消息 schema（§9.2）、`AtomicReference<ActionCmd> currentAction`、`volatile boolean apiMode`、ping/pong 心跳与断线清理；Exit：WS `pong` 可通 | ✅（pong/mode_ok/bye/error 已通，见 §6） |
 | M2 客户端控制 | P1.2 / P1.3 | `mixin/KeyboardInputMixin.java`、`mixin/MouseMixin.java`、`input/ActionApplier.java` | §5.3 输入隔离与动作注入；`mode` 切换 `unpressAll()` 防粘键；Exit：API_MODE 物理键鼠完全失效、HUMAN_MODE 透明、无粘键 |
 | M3 客户端视觉 | P1.4 / P1.5 / P1.6 | `gfx/FrameGrabber.java`、`mixin/GameRendererMixin.java`、`net/FrameSender.java`、`client_ws.py`、`action_space.py`、`scripts/random_agent.py` | §5.5 抓帧（先同步 `glReadPixels`）；帧头 `[4B frame_id][4B last_server_tick][8B wall_nanos][JPEG]` 上行；Exit：随机策略驱动移动/转向/攻击，224² 帧 ≥20fps 上行且与动作 1:1 |
 

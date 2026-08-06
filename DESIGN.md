@@ -706,6 +706,12 @@ Phase 0（环境/脚手架）
 - 随机/脚本策略完成 `collect_wood`：判定器 success=true、reward 来自服务端事件。
 - `GetVoxels` 与实景一致；`ComputePath` 输出可达航点。
 
+**M1 完成记录（2026-08-06，双端 ping 打通 ✅）**：
+- **客户端 WS（任务 1.1）**：`net/WsServer.java`（纯 Java 无 MC 依赖，含独立 `main` 测试入口）+ `VlaClient` 接线（守护线程启动 WS 端口 30001，`vla.ws.port` 系统属性可覆盖，apiMode 回调）；`tools/ws_harness.sh` 一键独立 harness。实测 4 项协议：`pong` / `mode_ok`（api_mode 翻转）/ `bye` / `error` 全过。
+- **服务端 gRPC（任务 2.1-2.2）**：`purpur-vla-plugin/`（paper-api + grpc-java 1.62.2 + protobuf 3.25.3 + shadow relocate `dev.vla.shadow.*`）；`/vla status` 命令（tick/tps/端口）；gRPC `127.0.0.1:50051` + ProtoReflectionService；`MainThreadDispatcher.runSync` 骨架。实测插件加载、tick=135、tps=20.0、端口监听。
+- **Python（任务 2.7 前置）**：proto 重生成（新增 Ping RPC）；`ServerGrpc.ping()` / `ClientWs.ping()` 实现；`scripts/ping_both.py` 双端验收 → `M1_PING_BOTH_OK`（WS pong + gRPC `server_tick=104`、`tps=20.21`、`version=git-Purpur-2062`）。
+- **遗留**：`action`/`reset_camera` 指令、**游戏内** WS 接入（需运行完整客户端，harness 已验证协议本身）属 M2；端口占用探测待补。
+
 ### 13.6 Phase 3：数据对齐与性能优化（最关键）
 
 **目标**：tick/frame 严格对齐、抓帧 <1ms、多 env 并行稳定。
@@ -787,7 +793,7 @@ M0 ─► M1 ─┬─► M2 ─► M3 ──┬──────────�
 | ID | 里程碑 | 阶段 | 依赖 | 任务 | Exit 标准 | 状态 |
 |---|---|---|---|---|---|---|
 | M0 | 环境脚手架 | P0 | — | 0.1-0.5 | 三端可跑：客户端可进服 / `vla_env` import / proto 代码生成 | ✅ |
-| M1 | 通信底座 | P1+P2 | M0 | 1.1, 2.1-2.2 | Python 可 ping 两端：WS `pong` + gRPC 返回 `server_tick` | ⬜ |
+| M1 | 通信底座 | P1+P2 | M0 | 1.1, 2.1-2.2 | Python 可 ping 两端：WS `pong` + gRPC 返回 `server_tick` | ✅ |
 | M2 | 客户端控制 | P1 | M1 | 1.2-1.3 | API_MODE 物理键鼠完全失效；HUMAN_MODE 透明；无粘键 | ⬜ |
 | M3 | 客户端视觉 | P1 | M1, M2 | 1.4-1.6 | 随机策略驱动移动/转向/攻击；224² 帧 ≥20fps 上行且与动作 1:1 | ⬜ |
 | M4 | 世界引擎 | P2 | M1 | 2.3-2.4 | 两次 reset 体素一致；玩家态/背包/时间/实体正确重置 | ⬜ |
@@ -905,7 +911,7 @@ fake-mc/
 ### 里程碑
 
 > 里程碑骨架（M0-M12：ID/阶段/依赖/任务/Exit/状态 + DAG）见 **§13.10**。
-> 当前状态：**M0 ✅ 已完成**（2026-08-06，验收记录见 §13.3）；M1 为下一无依赖起点，M2/M3（客户端）与 M4/M5/M6（服务端）可在 M1 后并行。
+> 当前状态：**M0 ✅**（§13.3）、**M1 ✅ 已完成**（2026-08-06，验收记录见 §13.5）；M2/M3（客户端）与 M4/M5/M6（服务端）可并行开工。
 
 ---
 

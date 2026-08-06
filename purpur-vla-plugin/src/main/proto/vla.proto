@@ -1,3 +1,4 @@
+// MIRROR of vla_env/proto/vla.proto，勿手动改；改请改源头后重新复制。
 // vla.proto — Python（vla_env）↔ Purpur 插件 共享的 gRPC 契约。
 // 对应 DESIGN.md §9.1；服务端写操作一律经 Bukkit 主线程调度（§4.2）。
 syntax = "proto3";

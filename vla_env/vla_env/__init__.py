@@ -4,9 +4,12 @@
 不拉取任何重依赖（grpcio / websockets / numpy / gymnasium / pillow /
 pyyaml），因此即使部分依赖缺失，顶层导入也不会崩溃（M0 验收硬性项）。
 
-子模块（env / action_space / obs / client_ws / server_grpc / lockstep）
-为 M0 里程碑桩，通过 ``__getattr__`` 在首次访问时才真正导入；桩模块自身
-对依赖做了防御性处理，保证 ``import vla_env`` 永不因依赖缺失而失败。
+子模块通过 ``__getattr__`` 在首次访问时才真正导入。里程碑状态：
+- M0：env / action_space / obs / lockstep 为桩。
+- M1：**已实现** —— ``client_ws.ClientWs``（WS ping/mode/close）与
+  ``server_grpc.ServerGrpc``（gRPC Ping/close）打通通信底座；
+  其余 RPC（ResetWorld/GetState/...）仍为 NotImplementedError 占位，
+  随 M4/M5/M6 实现。
 """
 
 __version__ = "0.1.0"
