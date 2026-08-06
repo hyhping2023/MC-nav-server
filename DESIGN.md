@@ -182,10 +182,17 @@ public void resetWorld(ResetRequest req, StreamObserver<ResetReply> resp) {
 ### 4.5 路径规划（Pathfinding）
 
 服务端输出 **Waypoints**（航点列表）作为观测/指令，供 VLA 参考与 reward 判定：
+**拓扑 A\* 定路 + 底层控制器执行** 分工：A* 只回答全局连通性（绕哪堵墙、避开岩浆、怎么上台阶），yaw 由航点方向由客户端 `look_at` 平滑转（不关心 360°）。
 
-- **首选：自研 3D A\***（确定性、可控成本表）：8 方向、每格成本由方块类型表决定（空气=1、可跳跃=2、岩浆/水=∞），支持跳跃/潜行标记。输出 `List<BlockPos>` 压缩为拐点序列。
-- 备选：复用原版寻路（NMS `PathFinder` + `WalkNodeEvaluator`，Mojang 映射类名），需 NMS 访问；或引入第三方 Bukkit 寻路库。
-- 外部接入：`ComputePath(from, to, cost_mode) → PathReply{waypoints[]}`，Python 可再喂给 VLA 作为语言/航点指令。
+- **首选：自研 3D A\***（确定性、可控成本表）：XZ 8 方向 + 跳跃/下落节点，每格成本由方块类型表决定（空气=1、可跳跃=2、岩浆/水=∞），输出拐点序列（压缩阈值切比雪夫 ≤2 格，防长直线切角）。
+- **移动模型必须严格匹配真实玩家**（2026-08-06 修复，防"被障碍挡住"）：
+  - **头部空间（`canStand`）**：可通行 = 该格非实心 **且 y+1 非实心**（2 格身高；1 格高洞、树冠下檐过不去）
+  - **斜向切角（`diagonalClear`）**：斜走时两个正交邻格必须可通行（0.6 格宽玩家无法从两实心方块间斜穿）
+  - **目标可达（`adjustGoal`）**：目标格实心（原木/墙）时，在目标周围 3D 邻域（水平±2、垂直 -8..+2）找最近**可站格**作导航终点——旧实现只向上找，树顶 log 被抬到树冠之上不可达（全路径失败）；优先落在目标旁地面
+  - 迭代上限 200k、open set 确定性排序、搜索范围以起终点扩张 ±24
+- 备选：复用原版寻路（NMS `PathFinder` + `WalkNodeEvaluator`），需 NMS 访问；或引入第三方 Bukkit 寻路库。
+- 外部接入：`ComputePath(from, to, cost_mode) → PathReply{waypoints[]}`；**A\* 必须能优雅失败**（found=false），调用方 fallback = 目标黑名单 + 游走换树。
+- 扩展方向：给可破坏方块设高成本可表达"挖穿 vs 绕行"；"垫脚爬高"需要**联合放置-移动 A\***（节点输出 `PLACE(x,y,z)` 动作），当前策略避开高目标只挖树干基座。
 
 ### 4.6 全局状态（Voxel 矩阵）
 
@@ -258,7 +265,7 @@ TaskSpec {
 | 控制项 | 注入方式 |
 |---|---|
 | 移动（前后左右/跳/潜行/疾跑） | Mixin `KeyboardInput#tick`：`@Inject(at=@At("HEAD"), cancellable=true)` 后，若 `API_MODE` 则 **cancel** 原逻辑，把 API 的浮点/布尔写入 `input` 字段（`pressingForward`、`movementForward/movementSideways`，1.20.5+ 为 `forwardImpulse/leftImpulse`）|
-| 视角（pitch/yaw） | Mixin `MouseHandler#turnPlayer`（Yarn: `Mouse`）HEAD cancel；每 tick 直接 `player.setYRot/setXRot` 平滑插值——**天然规避万向节死锁**（原版方法已限制 pitch∈[-90,90]、yaw 360° 环绕） |
+| 视角（pitch/yaw） | Mixin `MouseHandler#turnPlayer`（Yarn: `Mouse`）HEAD cancel（物理鼠标失效）；WS `look_at(x,y,z)`/`reset_camera(yaw,pitch)` 只设**视角目标**，`END_CLIENT_TICK` 里 `interpolateCamera` 按 `maxTurnDeg`（默认 40°/tick，`set_turn_speed` 可调）沿最短角差平滑转向（误差 <0.05° 收敛）——**消除瞬移"闪现"，天然规避万向节死锁**；`look_at` 用客户端自身眼位算精确朝向，消除服务端 pos 滞后的瞄准偏差 |
 | 攻击/使用/丢弃 | Mixin `MouseHandler#onMouseButton` 屏蔽物理按键；API 动作通过 `Minecraft#startAttack()/startUseItem()` 或直接设置对应 `KeyBinding.setPressed()` 驱动原版逻辑（挖掘进度、攻击冷却自动处理） |
 | 快捷栏 0-8 | `options.hotbarKeys[i].setPressed(bool)`（选中后 release，模拟按数字键） |
 | 物品栏开关 | `options.keyInventory.setPressed(bool)` |
@@ -315,9 +322,11 @@ WS 网络线程                                         // 编码 JPEG + 发送
 Python
 ```
 
-- 抓帧挂在 `GameRendererMixin`（world 渲染之后、HUD 之前）→ 画面纯净（无准星/血条，避免污染像素观测；需要 HUD 信息的模型可用本地状态补）。
-- 目标分辨率：默认 224×224（VLA 常用），窗口比例设为 1:1（或中心裁切）以**避免非等比拉伸导致 FOV 畸变**；`fov` 可配置（默认 70）。
-- 帧率：客户端 60/120 FPS 渲染，采集端按 `record.fps`（默认 20，与 tick 对齐）降采样。
+- **抓帧挂点（可切换，2026-08-06 修复）**：
+  - **默认（VLA 观测）**：`WorldRenderEvents.LAST`（世界+实体渲染后、HUD 前）→ 画面纯净（无准星/血条/手），避免污染像素观测。
+  - **Demo/可视化（`set_capture_ui hud=true`）**：`GameRendererMixin` 在 `GameRenderer.render` **TAIL** 抓帧 → 主 framebuffer 已含世界+手+HUD+准星（完整游戏画面）。两者互斥（LAST 加 `!captureUi` 守卫），WS `set_capture_ui` 切换。
+- **目标分辨率（可运行时切换，2026-08-06 新增）**：默认 224×224（VLA 常用）；WS `set_capture` 可切到显式 WxH 或 **0=原生 framebuffer 分辨率**（demo 视频用，保留游戏原始比例、不升采样）。FBO 尺寸变化自动重建；`FrameData` 携带 width/height，FrameSender 按每帧尺寸编码。
+- 帧率：客户端 60/120 FPS 渲染，采集端按 `record.fps`（默认 20，与 tick 对齐）降采样；FrameSender 上限 30fps 流控。
 - **线程铁律**：所有 GL 调用只在渲染线程；数据交递用无锁队列（`ConcurrentLinkedQueue` / MPSC ring buffer），编码与网络传输放后台线程。
 
 ### 5.6 帧与 tick 对齐（插件消息通道）
@@ -780,6 +789,14 @@ Phase 0（环境/脚手架）
 - **`scripts/collect_episodes.py`**：N episode 全栈采集（随机动作，`/tmp` JSONL）+ 四者计数断言 + 对齐率汇总。
 - **验收**：10ep×60steps → `frames=600 actions=600 rewards=600 states=600 counts_consistent=True`；`align steps=600 mismatch=0 align_rate=1.00 max_diff=3`（tol=2，窗口 ticks+2=4）；`M8_ALIGN_OK episodes=10 align_rate=1.00`。
 - **踩坑**：① WS 二进制帧撞 `_recv_json` 的 utf-32-be BOM 解析（帧头 frame_id=0x0000FEFF 时），修 `_recv_json` 跳过 bytes/乱码仅收 dict，episode 间切换从 ~10s 降到即时；② 客户端被遮挡时 MC 静默断连（Throwable catch 防御，未根因）；③ 多屏截图看不到被遮窗口，用 jstack + 抓帧计数确认渲染。
+
+**Demo 三问题修复记录（2026-08-06，`5b26aa6`）**：
+用户反馈 demo 视频三个问题，全部修复并端到端验收：
+1. **无 HUD（物品栏/手/准星缺失）**：抓帧默认在 `WorldRenderEvents.LAST`（HUD 前，VLA 观测需要干净画面）。新增 WS `set_capture_ui hud=true` 切换抓帧挂点到 `GameRenderer.render` **TAIL**（含世界+手+HUD+准星），demo 录制默认开启；VLA 观测默认保持无 HUD 不变。
+2. **突然闪现**：`look_at`/`reset_camera` 原为 `setYaw/setPitch` 瞬移。改为**平滑转向**——只设视角目标，`END_CLIENT_TICK` 里按 `maxTurnDeg`（默认 40°/tick）沿最短角差插值收敛（误差 <0.05° 停用）；`look_at` 用客户端自身眼位算精确朝向，消除服务端 pos 滞后瞄准偏差。
+3. **被障碍挡住（3D 路径规划）**：根因有两层——(a) A* 目标微调只向上找，树顶 log 抬到树冠之上不可达 → 全路径失败（`ComputePath` 实测全空）；(b) 玩家撞墙后"重算路径"不改变方向，永远卡死。修复：`adjustGoal` 在目标周围 3D 邻域（水平±2、垂直 -8..+2）找最近可站格（7/8 目标有路径，原全空）；策略 approach 卡死先 `back` 3 步解卡，同目标二次卡死黑名单+游走换树。
+- **验收**：`DEMO_OK steps=219 progress=1.00`；视频 `datasets/demo/collect_wood_agent_view.mp4` 1708×960 原生 16:9、44.5s、含完整 HUD，帧间平滑无闪现。移动模型细节（canStand/diagonalClear/adjustGoal）已并入 §4.5。
+- **附带发现**：本机 MC 1.20.1 + fabric-api 0.92.11 中 `WorldRenderEvents.LAST` 实际已含 HUD（环境差异）；"VLA 观测默认干净"若需严格保证，抓帧挂点应改到 `inGameHud.render` 之前（待 M9 处理）。
 
 ### 13.7 Phase 4：VLA 接入与数据管线
 
