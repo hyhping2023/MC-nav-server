@@ -22,6 +22,7 @@ import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.Session;
 import net.minecraft.network.PacketByteBuf;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -183,6 +184,27 @@ public final class VlaClient implements ClientModInitializer {
                         if (frameGrabber != null) {
                             frameGrabber.setResolution(width, height);
                         }
+                    });
+                }
+            }
+
+            @Override
+            public void onLookAt(double x, double y, double z) {
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    // 用客户端自身眼位算精确朝向（消除服务端 pos 滞后的瞄准偏差）
+                    client.execute(() -> {
+                        if (client.player == null) {
+                            return;
+                        }
+                        Vec3d eye = client.player.getEyePos();
+                        double dx = x - eye.x;
+                        double dy = y - eye.y;
+                        double dz = z - eye.z;
+                        double h = Math.sqrt(dx * dx + dz * dz);
+                        client.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                        client.player.setPitch(h > 1e-6
+                                ? (float) Math.toDegrees(Math.atan2(-dy, h)) : 0.0f);
                     });
                 }
             }

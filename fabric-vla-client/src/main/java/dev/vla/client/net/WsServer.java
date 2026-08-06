@@ -47,6 +47,10 @@ public class WsServer extends WebSocketServer {
         /** M7.2：运行时切换抓帧分辨率（0 = 原生 framebuffer 分辨率，保留游戏原始比例）。 */
         default void onSetCapture(int width, int height) {
         }
+
+        /** M7.3：客户端用自身眼位计算到世界坐标的精确朝向（消除服务端 pos 滞后的瞄准偏差）。 */
+        default void onLookAt(double x, double y, double z) {
+        }
     }
 
     public static final String API_MODE = "api";
@@ -188,6 +192,18 @@ public class WsServer extends WebSocketServer {
                 ok.addProperty("type", "capture_ok");
                 ok.addProperty("width", w);
                 ok.addProperty("height", h);
+                conn.send(GSON.toJson(ok));
+            }
+            case "look_at" -> {
+                double x = obj.has("x") ? obj.get("x").getAsDouble() : 0.0;
+                double y = obj.has("y") ? obj.get("y").getAsDouble() : 0.0;
+                double z = obj.has("z") ? obj.get("z").getAsDouble() : 0.0;
+                handler.onLookAt(x, y, z);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "look_ok");
+                ok.addProperty("x", x);
+                ok.addProperty("y", y);
+                ok.addProperty("z", z);
                 conn.send(GSON.toJson(ok));
             }
             default -> sendError(conn, "unknown cmd: " + cmd);
