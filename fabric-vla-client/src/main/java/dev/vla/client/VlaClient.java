@@ -1,9 +1,13 @@
 package dev.vla.client;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import dev.vla.client.gfx.FrameGrabber;
 import dev.vla.client.input.ActionApplier;
 import dev.vla.client.input.ActionCmd;
 import dev.vla.client.mixin.MinecraftClientAccessor;
+import dev.vla.client.nav.NavExecutor;
 import dev.vla.client.net.FrameSender;
 import dev.vla.client.net.WsServer;
 import net.fabricmc.api.ClientModInitializer;
@@ -23,6 +27,7 @@ import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.Session;
 import net.minecraft.network.PacketByteBuf;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.Identifier;
@@ -33,6 +38,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -92,8 +98,9 @@ public final class VlaClient implements ClientModInitializer {
      */
     private volatile boolean captureUi = false;
 
-    /** M9.1：平滑视角每 tick 最大转角（deg/tick，DESIGN.md §5.3；WS set_turn_speed 可覆盖）。 */
-    private static final double MAX_TURN_DEG = 40.0;
+    /** M9.1：平滑视角每 tick 最大转角（deg/tick，DESIGN.md §5.3；WS set_turn_speed 可覆盖）。
+     *  M9.2：40→90——approach 转向不再逐点罚站（90°/tick = 90° 拐弯 1 tick 到位）。 */
+    private static final double MAX_TURN_DEG = 90.0;
     private volatile double maxTurnDeg = MAX_TURN_DEG;
 
     /** M9.1：视角插值目标（look_at/reset_camera 只更新目标，END_CLIENT_TICK 每 tick 平滑转向）。 */
@@ -104,10 +111,14 @@ public final class VlaClient implements ClientModInitializer {
     /** M3：帧队列（渲染线程只入队，FrameSender 后台线程消费编码+上行）。 */
     private final ConcurrentLinkedQueue<FrameGrabber.FrameData> frameQueue = new ConcurrentLinkedQueue<>();
 
+    private static final Gson GSON = new Gson();
+
     private WsServer wsServer;
     private FrameGrabber frameGrabber;
     private FrameSender frameSender;
     private final AtomicBoolean autoJoinAttempted = new AtomicBoolean(false);
+    /** M9.3：本地路径跟随控制器（goto_path/goto_cancel 驱动；活跃时拥有移动按键）。 */
+    private NavExecutor navExecutor;
 
     @Override
     public void onInitializeClient() {
@@ -120,9 +131,37 @@ public final class VlaClient implements ClientModInitializer {
         registerFramePipeline();
         registerAutoJoin();
 
+        // M9.3：本地路径跟随控制器——状态经 WS 上行 goto_status（一个转换一次）
+        navExecutor = new NavExecutor(event -> {
+            JsonObject json = new JsonObject();
+            json.addProperty("type", "goto_status");
+            json.addProperty("state", event.status().name().toLowerCase());
+            json.add("pos", toJsonArray(event.pos()));
+            json.add("wp", toJsonArray(event.wp()));
+            json.addProperty("detail", event.detail());
+            if (wsServer != null) {
+                wsServer.sendText(json.toString());
+            }
+            // 导航结束：清空移动（防止 KeyboardInputMixin 继续读到最后一次 forward）
+            currentAction.set(new ActionCmd());
+            LOGGER.info("[vla-client] goto_status {} wp={} pos={}", event.status(),
+                    event.wp(), event.pos());
+        });
+
         // M7.2：启动即应用 API 模式 UI（不抓鼠标、失焦不弹菜单）——CLIENT_STARTED 在
         // 客户端线程触发，此时 MinecraftClient 已可用。
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> applyApiModeUi(client, true));
+    }
+
+    /** M9.3：把 BlockPos 转成 [x,y,z] 数组 JSON（null → 空数组）。 */
+    private static JsonArray toJsonArray(BlockPos pos) {
+        JsonArray arr = new JsonArray();
+        if (pos != null) {
+            arr.add(pos.getX());
+            arr.add(pos.getY());
+            arr.add(pos.getZ());
+        }
+        return arr;
     }
 
     /**
@@ -205,6 +244,33 @@ public final class VlaClient implements ClientModInitializer {
             }
 
             @Override
+            public void onGotoPath(List<int[]> waypoints) {
+                LOGGER.info("[vla-client] WS goto_path wps={}", waypoints.size());
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    client.execute(() -> {
+                        List<BlockPos> poses = new ArrayList<>();
+                        for (int[] w : waypoints) {
+                            poses.add(new BlockPos(w[0], w[1], w[2]));
+                        }
+                        navExecutor.setPath(poses);
+                    });
+                }
+            }
+
+            @Override
+            public void onGotoCancel() {
+                LOGGER.info("[vla-client] WS goto_cancel");
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    client.execute(() -> {
+                        navExecutor.cancel();
+                        currentAction.set(new ActionCmd()); // 释放移动按键
+                    });
+                }
+            }
+
+            @Override
             public void onSetCapture(int width, int height) {
                 LOGGER.info("[vla-client] WS set_capture {}x{} (0=原生)", width, height);
                 MinecraftClient client = MinecraftClient.getInstance();
@@ -220,6 +286,11 @@ public final class VlaClient implements ClientModInitializer {
 
             @Override
             public void onLookAt(double x, double y, double z) {
+                onLookAt(x, y, z, 0.0);
+            }
+
+            @Override
+            public void onLookAt(double x, double y, double z, double pitchClamp) {
                 MinecraftClient client = MinecraftClient.getInstance();
                 if (client != null) {
                     // 用客户端自身眼位算精确朝向（消除服务端 pos 滞后的瞄准偏差）
@@ -233,8 +304,12 @@ public final class VlaClient implements ClientModInitializer {
                         double dz = z - eye.z;
                         double h = Math.sqrt(dx * dx + dz * dz);
                         // M9.1：只更新插值目标（平滑转向），由 END_CLIENT_TICK 收敛；目标值精确 → 收敛后零误差
-                        setCameraTarget(Math.toDegrees(Math.atan2(-dx, dz)),
-                                h > 1e-6 ? Math.toDegrees(Math.atan2(-dy, h)) : 0.0);
+                        // M9.2：pitchClamp>0 时夹紧 |pitch|（approach 瞄航点格中心但保持平视，不低头）
+                        double pitch = h > 1e-6 ? Math.toDegrees(Math.atan2(-dy, h)) : 0.0;
+                        if (pitchClamp > 0) {
+                            pitch = MathHelper.clamp(pitch, -pitchClamp, pitchClamp);
+                        }
+                        setCameraTarget(Math.toDegrees(Math.atan2(-dx, dz)), pitch);
                     });
                 }
             }
@@ -247,6 +322,13 @@ public final class VlaClient implements ClientModInitializer {
             @Override
             public void onDisconnect(String session) {
                 LOGGER.info("[vla-client] WS session disconnected: {}", session);
+                // WS 断开后清空电平动作；否则最后一次 attack 会持续到下一次连接。
+                // M9.3：同时取消本地导航，防止玩家继续自动走。
+                if (navExecutor != null) {
+                    navExecutor.cancel();
+                }
+                currentAction.set(null);
+                unpressAllKeys();
             }
         });
 
@@ -397,13 +479,31 @@ public final class VlaClient implements ClientModInitializer {
                 return; // HUMAN_MODE 透明
             }
             ActionApplier.resetKeys(client);
-            ActionCmd cmd = currentAction.get();   // 电平保持：不消费
-            if (cmd != null && client.player != null) {
-                ActionApplier.apply(client, client.player, cmd);
+            if (client.player == null) {
+                return;
             }
-            // M9.1：平滑视角插值（look_at/reset_camera 目标，DESIGN.md §5.3）
-            if (client.player != null) {
-                interpolateCamera(client.player);
+            // M9.3：本地路径跟随控制器活跃时，用它的移动动作覆盖 currentAction
+            // （KeyboardInputMixin 读 currentAction 注入移动键）；导航结束返回 null
+            // 时清空为 camera-only，防止最后一条 forward 粘键。
+            if (navExecutor.isActive()) {
+                ActionCmd navCmd = navExecutor.tick(client.player);
+                if (navCmd != null) {
+                    currentAction.set(navCmd);
+                } else {
+                    currentAction.set(new ActionCmd());
+                }
+            }
+            // 先收敛视角，再注入 attack/use。按键会驱动下一游戏 tick 的原版逻辑，
+            // 若先注入再转向，攻击会用上一 tick 的准星方向，表现为“瞄准了但不出剑/打偏”。
+            interpolateCamera(client.player);
+            ActionCmd cmd = currentAction.get();   // 电平保持：不消费
+            if (cmd != null) {
+                ActionApplier.apply(client, client.player, cmd);
+                // 目标已在本 tick 先完成视角收敛时，直接调用原版 doAttack；
+                // 防止 attackKey 仅在 tick 末设置而错过当前准星目标。
+                if (cmd.attack) {
+                    ((MinecraftClientAccessor) (Object) client).invokeDoAttack();
+                }
             }
         });
     }
@@ -425,7 +525,7 @@ public final class VlaClient implements ClientModInitializer {
     }
 
     /** M9.1：设置视角插值目标（客户端线程调用）；pitch 夹紧 ±90（原版范围）。 */
-    private void setCameraTarget(double yaw, double pitch) {
+    public void setCameraTarget(double yaw, double pitch) {
         targetYaw = yaw;
         targetPitch = MathHelper.clamp(pitch, -90.0, 90.0);
         cameraTargetActive = true;

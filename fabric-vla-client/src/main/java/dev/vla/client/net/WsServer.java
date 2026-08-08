@@ -12,6 +12,8 @@ import org.java_websocket.server.WebSocketServer;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -54,12 +56,25 @@ public class WsServer extends WebSocketServer {
         default void onLookAt(double x, double y, double z) {
         }
 
+        /** M9.2：同 onLookAt，pitchClamp>0 时夹紧 |pitch|（approach 平视前进，不低头看脚下）。 */
+        default void onLookAt(double x, double y, double z, double pitchClamp) {
+            onLookAt(x, y, z);
+        }
+
         /** M9.1：切换 HUD 抓帧（true = GameRenderer.render TAIL 抓含 HUD/手/准星的完整画面；false = 默认纯净画面）。 */
         default void onSetCaptureUi(boolean hud) {
         }
 
         /** M9.1：覆盖平滑视角每 tick 最大转角（deg/tick，默认 40.0）。 */
         default void onSetTurnSpeed(double degPerTick) {
+        }
+
+        /** M9.3：收到本地导航航点（有序方块坐标 [x,y,z]，来自服务端 A* 的 walk/jump/fall 位置）。 */
+        default void onGotoPath(List<int[]> waypoints) {
+        }
+
+        /** M9.3：取消本地导航。 */
+        default void onGotoCancel() {
         }
     }
 
@@ -103,6 +118,15 @@ public class WsServer extends WebSocketServer {
         for (WebSocket conn : sessions.keySet()) {
             if (conn.isOpen()) {
                 conn.send(data.slice());
+            }
+        }
+    }
+
+    /** M9.3：文本消息上行（goto_status 事件），发给所有连接中的会话。 */
+    public void sendText(String text) {
+        for (WebSocket conn : sessions.keySet()) {
+            if (conn.isOpen()) {
+                conn.send(text);
             }
         }
     }
@@ -208,7 +232,13 @@ public class WsServer extends WebSocketServer {
                 double x = obj.has("x") ? obj.get("x").getAsDouble() : 0.0;
                 double y = obj.has("y") ? obj.get("y").getAsDouble() : 0.0;
                 double z = obj.has("z") ? obj.get("z").getAsDouble() : 0.0;
-                handler.onLookAt(x, y, z);
+                double pitchClamp = obj.has("pitch_clamp")
+                        ? obj.get("pitch_clamp").getAsDouble() : 0.0;
+                if (pitchClamp > 0) {
+                    handler.onLookAt(x, y, z, pitchClamp);
+                } else {
+                    handler.onLookAt(x, y, z);
+                }
                 JsonObject ok = new JsonObject();
                 ok.addProperty("type", "look_ok");
                 ok.addProperty("x", x);
@@ -230,6 +260,31 @@ public class WsServer extends WebSocketServer {
                 JsonObject ok = new JsonObject();
                 ok.addProperty("type", "turn_speed_ok");
                 ok.addProperty("deg", deg);
+                conn.send(GSON.toJson(ok));
+            }
+            case "goto_path" -> {
+                List<int[]> wps = new ArrayList<>();
+                if (obj.has("waypoints") && obj.get("waypoints").isJsonArray()) {
+                    for (com.google.gson.JsonElement e : obj.getAsJsonArray("waypoints")) {
+                        JsonArray pt = e.getAsJsonArray();
+                        if (pt.size() >= 3) {
+                            wps.add(new int[]{
+                                    (int) pt.get(0).getAsDouble(),
+                                    (int) pt.get(1).getAsDouble(),
+                                    (int) pt.get(2).getAsDouble()});
+                        }
+                    }
+                }
+                handler.onGotoPath(wps);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "goto_ok");
+                ok.addProperty("waypoints", wps.size());
+                conn.send(GSON.toJson(ok));
+            }
+            case "goto_cancel" -> {
+                handler.onGotoCancel();
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "goto_cancel_ok");
                 conn.send(GSON.toJson(ok));
             }
             default -> sendError(conn, "unknown cmd: " + cmd);
