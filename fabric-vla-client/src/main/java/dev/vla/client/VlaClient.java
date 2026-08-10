@@ -6,8 +6,12 @@ import com.google.gson.JsonObject;
 import dev.vla.client.gfx.FrameGrabber;
 import dev.vla.client.input.ActionApplier;
 import dev.vla.client.input.ActionCmd;
+import dev.vla.client.input.KeyRecorder;
 import dev.vla.client.mixin.MinecraftClientAccessor;
+import dev.vla.client.nav.Aim;
 import dev.vla.client.nav.NavExecutor;
+import dev.vla.client.nav.PillarExecutor;
+import dev.vla.client.nav.ToolPolicy;
 import dev.vla.client.net.FrameSender;
 import dev.vla.client.net.WsServer;
 import net.fabricmc.api.ClientModInitializer;
@@ -26,7 +30,10 @@ import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.Session;
+import net.minecraft.item.ItemStack;
 import net.minecraft.network.PacketByteBuf;
+import net.minecraft.registry.Registries;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -119,6 +126,21 @@ public final class VlaClient implements ClientModInitializer {
     private final AtomicBoolean autoJoinAttempted = new AtomicBoolean(false);
     /** M9.3：本地路径跟随控制器（goto_path/goto_cancel 驱动；活跃时拥有移动按键）。 */
     private NavExecutor navExecutor;
+    /** M11：垫方块爬高技能（pillar_up/pillar_cancel 驱动；活跃时优先于 navExecutor 拥有按键）。 */
+    private PillarExecutor pillarExecutor;
+    /** M11.5：人类化整形滤波器（只整形执行器输出；WS set_humanize 配置，§17.2）。 */
+    private final dev.vla.client.nav.Humanizer humanizer = new dev.vla.client.nav.Humanizer();
+    /** M11.6：视线工具策略（crosshair 命中 → 切工具；档位由 WS set_tool_mode 下发）。 */
+    private final ToolPolicy toolPolicy = new ToolPolicy();
+
+    /** M11：上一 tick 注入的动作副本（KeyRecorder.diff 产生按键 down/up 事件）。 */
+    private ActionCmd lastInjectedAction = new ActionCmd();
+
+    /**
+     * 挖块计划：位置 + 规划器标注的方块/工具（规划器查体素后写入；
+     * block/tool 可为 null → NavExecutor 按方块自动判断工具）。
+     */
+    public record DigPlan(BlockPos pos, String block, String tool) {}
 
     @Override
     public void onInitializeClient() {
@@ -131,7 +153,8 @@ public final class VlaClient implements ClientModInitializer {
         registerFramePipeline();
         registerAutoJoin();
 
-        // M9.3：本地路径跟随控制器——状态经 WS 上行 goto_status（一个转换一次）
+        // M9.3 + M10：本地路径跟随控制器——状态经 WS 上行 goto_status，
+        // 局部路径点经 WS 上行 path_debug（供 PathVisualizer 白色粒子可视化）。
         navExecutor = new NavExecutor(event -> {
             JsonObject json = new JsonObject();
             json.addProperty("type", "goto_status");
@@ -142,10 +165,47 @@ public final class VlaClient implements ClientModInitializer {
             if (wsServer != null) {
                 wsServer.sendText(json.toString());
             }
-            // 导航结束：清空移动（防止 KeyboardInputMixin 继续读到最后一次 forward）
-            currentAction.set(new ActionCmd());
+            currentAction.set(releaseLevels(currentAction.get()));
             LOGGER.info("[vla-client] goto_status {} wp={} pos={}", event.status(),
                     event.wp(), event.pos());
+        }, localPath -> {
+            // M10：客户端局部路径（LocalPathfinder）→ WS path_debug 上行
+            JsonObject json = new JsonObject();
+            json.addProperty("type", "path_debug");
+            JsonArray arr = new JsonArray();
+            for (BlockPos p : localPath) {
+                JsonArray pt = new JsonArray();
+                pt.add(p.getX());
+                pt.add(p.getY());
+                pt.add(p.getZ());
+                arr.add(pt);
+            }
+            json.add("points", arr);
+            if (wsServer != null) {
+                wsServer.sendText(json.toString());
+            }
+            LOGGER.info("[vla-client] path_debug points={}", localPath.size());
+        });
+
+        // M11：垫方块爬高技能——进度/结束经 WS 上行 pillar_status。
+        // FAILED 带 reason（head_blocked / no_block_item / in_fluid / place_failed ...），
+        // Python 侧据此选择兜底（挖阶梯 / 换目标 / teleport）。
+        pillarExecutor = new PillarExecutor(event -> {
+            JsonObject json = new JsonObject();
+            json.addProperty("type", "pillar_status");
+            json.addProperty("state", event.status().name().toLowerCase());
+            json.addProperty("placed", event.placed());
+            json.addProperty("feet_y", event.feetY());
+            json.addProperty("reason", event.reason() == null ? "" : event.reason());
+            json.addProperty("detail", event.detail());
+            if (wsServer != null) {
+                wsServer.sendText(json.toString());
+            }
+            if (event.status() != PillarExecutor.Status.PROGRESS) {
+                currentAction.set(new ActionCmd());   // 结束即释放按键
+            }
+            LOGGER.info("[vla-client] pillar_status {} placed={} feetY={} reason={}",
+                    event.status(), event.placed(), event.feetY(), event.reason());
         });
 
         // M7.2：启动即应用 API 模式 UI（不抓鼠标、失焦不弹菜单）——CLIENT_STARTED 在
@@ -244,8 +304,9 @@ public final class VlaClient implements ClientModInitializer {
             }
 
             @Override
-            public void onGotoPath(List<int[]> waypoints) {
-                LOGGER.info("[vla-client] WS goto_path wps={}", waypoints.size());
+            public void onGotoPath(List<int[]> waypoints, List<JsonObject> digTargets) {
+                LOGGER.info("[vla-client] WS goto_path wps={} dig={}", waypoints.size(),
+                        digTargets == null ? 0 : digTargets.size());
                 MinecraftClient client = MinecraftClient.getInstance();
                 if (client != null) {
                     client.execute(() -> {
@@ -253,7 +314,20 @@ public final class VlaClient implements ClientModInitializer {
                         for (int[] w : waypoints) {
                             poses.add(new BlockPos(w[0], w[1], w[2]));
                         }
-                        navExecutor.setPath(poses);
+                        List<DigPlan> digs = new ArrayList<>();
+                        if (digTargets != null) {
+                            for (JsonObject d : digTargets) {
+                                int x = d.get("x").getAsInt();
+                                int y = d.get("y").getAsInt();
+                                int z = d.get("z").getAsInt();
+                                String block = d.has("block") && !d.get("block").isJsonNull()
+                                        ? d.get("block").getAsString() : null;
+                                String tool = d.has("tool") && !d.get("tool").isJsonNull()
+                                        ? d.get("tool").getAsString() : null;
+                                digs.add(new DigPlan(new BlockPos(x, y, z), block, tool));
+                            }
+                        }
+                        navExecutor.setPath(poses, digs);
                     });
                 }
             }
@@ -265,9 +339,66 @@ public final class VlaClient implements ClientModInitializer {
                 if (client != null) {
                     client.execute(() -> {
                         navExecutor.cancel();
-                        currentAction.set(new ActionCmd()); // 释放移动按键
+                        // 释放移动按键但保留未消费的 hotbar/camera（防吞选槽，见 releaseLevels）
+                        currentAction.set(releaseLevels(currentAction.get()));
                     });
                 }
+            }
+
+            @Override
+            public void onPillarUp(int targetY, int maxBlocks, String item) {
+                LOGGER.info("[vla-client] WS pillar_up target_y={} max_blocks={} item={}",
+                        targetY, maxBlocks, item);
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    client.execute(() -> {
+                        // 垫方块要求水平速度≈0，与导航的持续 forward 互斥 → 先停导航
+                        navExecutor.cancel();
+                        currentAction.set(releaseLevels(currentAction.get()));
+                        pillarExecutor.start(targetY, maxBlocks, item);
+                    });
+                }
+            }
+
+            @Override
+            public void onPillarCancel() {
+                LOGGER.info("[vla-client] WS pillar_cancel");
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    client.execute(() -> {
+                        pillarExecutor.cancel();
+                        currentAction.set(releaseLevels(currentAction.get()));
+                    });
+                }
+            }
+
+            @Override
+            public void onSetKeyLog(boolean enabled) {
+                LOGGER.info("[vla-client] WS set_key_log enabled={}", enabled);
+                KeyRecorder.setEnabled(enabled);
+            }
+
+            @Override
+            public void onSetHumanize(boolean enabled, long seed) {
+                LOGGER.info("[vla-client] WS set_humanize enabled={} seed={}", enabled, seed);
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    client.execute(() -> humanizer.configure(enabled, seed));
+                }
+            }
+
+            @Override
+            public void onSetToolMode(String mode) {
+                LOGGER.info("[vla-client] WS set_tool_mode mode={}", mode);
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client != null) {
+                    client.execute(() -> toolPolicy.setMode(mode));
+                }
+            }
+
+            @Override
+            public JsonObject onStateRequest() {
+                return buildStateJson();
             }
 
             @Override
@@ -299,17 +430,15 @@ public final class VlaClient implements ClientModInitializer {
                             return;
                         }
                         Vec3d eye = client.player.getEyePos();
-                        double dx = x - eye.x;
-                        double dy = y - eye.y;
-                        double dz = z - eye.z;
-                        double h = Math.sqrt(dx * dx + dz * dz);
                         // M9.1：只更新插值目标（平滑转向），由 END_CLIENT_TICK 收敛；目标值精确 → 收敛后零误差
                         // M9.2：pitchClamp>0 时夹紧 |pitch|（approach 瞄航点格中心但保持平视，不低头）
-                        double pitch = h > 1e-6 ? Math.toDegrees(Math.atan2(-dy, h)) : 0.0;
+                        // M11：pitch 经 Aim 计算——目标与玩家同一列（正上/正下）时给 ∓90 而不是
+                        //      退化成平视（老代码 h≈0 → 0.0，「挖头顶/瞄脚下」永远瞄不中）。
+                        double pitch = Aim.pitch(eye.x, eye.y, eye.z, x, y, z);
                         if (pitchClamp > 0) {
                             pitch = MathHelper.clamp(pitch, -pitchClamp, pitchClamp);
                         }
-                        setCameraTarget(Math.toDegrees(Math.atan2(-dx, dz)), pitch);
+                        setCameraTarget(Aim.yaw(eye.x, eye.z, x, z), pitch);
                     });
                 }
             }
@@ -326,6 +455,9 @@ public final class VlaClient implements ClientModInitializer {
                 // M9.3：同时取消本地导航，防止玩家继续自动走。
                 if (navExecutor != null) {
                     navExecutor.cancel();
+                }
+                if (pillarExecutor != null) {
+                    pillarExecutor.cancel();
                 }
                 currentAction.set(null);
                 unpressAllKeys();
@@ -482,29 +614,54 @@ public final class VlaClient implements ClientModInitializer {
             if (client.player == null) {
                 return;
             }
-            // M9.3：本地路径跟随控制器活跃时，用它的移动动作覆盖 currentAction
-            // （KeyboardInputMixin 读 currentAction 注入移动键）；导航结束返回 null
-            // 时清空为 camera-only，防止最后一条 forward 粘键。
-            if (navExecutor.isActive()) {
-                ActionCmd navCmd = navExecutor.tick(client.player);
+            if (pillarExecutor.isActive()) {
+                // M11：垫方块技能优先于导航拥有按键——它要求水平速度≈0，
+                // 与 NavExecutor 的持续 forward 互斥。放置窗口只有跳跃第 3-8 tick，
+                // **不做人类化整形**（§17.2：整形会打断技能时序）。
+                ActionCmd pillarCmd = pillarExecutor.tick(client.player);
+                currentAction.set(pillarCmd != null ? pillarCmd
+                        : releaseLevels(currentAction.get()));
+            } else if (navExecutor.isActive()) {
+                // M11.5：导航输出经 Humanizer 整形（步态微松/挖掘节奏），实际注入并被
+                // 帧头按键采样记录的按键呈现人类节奏。外部 VLA 直发 action 不整形。
+                ActionCmd navCmd = humanizer.shape(navExecutor.tick(client.player));
                 if (navCmd != null) {
                     currentAction.set(navCmd);
                 } else {
-                    currentAction.set(new ActionCmd());
+                    currentAction.set(releaseLevels(currentAction.get()));
                 }
             }
             // 先收敛视角，再注入 attack/use。按键会驱动下一游戏 tick 的原版逻辑，
-            // 若先注入再转向，攻击会用上一 tick 的准星方向，表现为“瞄准了但不出剑/打偏”。
+            // 若先注入再转向，攻击会用上一 tick 的准星方向，表现为"瞄准了但不出剑/打偏"。
             interpolateCamera(client.player);
             ActionCmd cmd = currentAction.get();   // 电平保持：不消费
+            // M11.5：镜头微漂（人类手抖）——视角插值之后、挖掘瞄准期除外；
+            // 帧头 yaw/pitch delta 会如实记录这份抖动。
+            humanizer.cameraDrift(client.player,
+                    (pillarExecutor != null && pillarExecutor.isActive())
+                            || (cmd != null && cmd.attack));
+            // M11.6：视线工具策略——crosshair 命中 → 切工具（auto/melee/none）。
+            // busy（挖穿/放置子模式或 pillar）时跳过，由技能自己选槽；切槽发生在
+            // 动作注入之前，保证本 tick 的 look_at+attack 用上新工具。
+            toolPolicy.apply(client, client.player,
+                    (pillarExecutor != null && pillarExecutor.isActive())
+                            || (navExecutor != null && navExecutor.isBusy()));
             if (cmd != null) {
+                // M11：diff 注入动作 → key_event 上行（按下/抬起事件，帧↔按键对齐补充）。
+                // 必须先 diff 再 copy（apply 会把一次性字段 hotbar/drop/inventory 清零）。
+                KeyRecorder.diff(lastInjectedAction, cmd);
+                lastInjectedAction = cmd.copy();
                 ActionApplier.apply(client, client.player, cmd);
-                // 目标已在本 tick 先完成视角收敛时，直接调用原版 doAttack；
-                // 防止 attackKey 仅在 tick 末设置而错过当前准星目标。
                 if (cmd.attack) {
                     ((MinecraftClientAccessor) (Object) client).invokeDoAttack();
                 }
             }
+            // M11：排空按键事件（含 HUMAN 模式 mixin 记录的），经 WS 文本上行
+            KeyRecorder.drainTo(text -> {
+                if (wsServer != null) {
+                    wsServer.sendText(text);
+                }
+            });
         });
     }
 
@@ -522,6 +679,28 @@ public final class VlaClient implements ClientModInitializer {
         } else {
             client.options.pauseOnLostFocus = savedPauseOnLostFocus;
         }
+    }
+
+    /**
+     * 释放电平按键但**保留未消费的一次性字段**（hotbar/camera/drop/inventory，M11.5）。
+     *
+     * <p>修「杀猪不持剑」竞争：Python 发 goto_cancel 后紧跟 action{hotbar=剑}——
+     * cancel 的清空任务经 client.execute 调度，晚于 WS 线程写入的 hotbar 动作执行，
+     * 老代码 `currentAction.set(new ActionCmd())` 把选槽整个吞掉（实测 kill 攻击帧
+     * 大多持铲/镐）。释放电平、保留 one-shot 即无此竞争。
+     */
+    private static ActionCmd releaseLevels(ActionCmd cur) {
+        ActionCmd a = cur != null ? cur.copy() : new ActionCmd();
+        a.forward = false;
+        a.back = false;
+        a.left = false;
+        a.right = false;
+        a.jump = false;
+        a.sneak = false;
+        a.sprint = false;
+        a.attack = false;
+        a.use = false;
+        return a;
     }
 
     /** M9.1：设置视角插值目标（客户端线程调用）；pitch 夹紧 ±90（原版范围）。 */
@@ -569,6 +748,45 @@ public final class VlaClient implements ClientModInitializer {
         for (KeyBinding keyBinding : client.options.allKeys) {
             keyBinding.setPressed(false);
         }
+    }
+
+    /** M11：WS state 上行（docs/p1_protocol.md §2.4）——aimed_block/held_item/fps/selected_slot。 */
+    private JsonObject buildStateJson() {
+        JsonObject j = new JsonObject();
+        j.addProperty("type", "state");
+        j.addProperty("frame_id", frameGrabber != null ? frameGrabber.getLastFrameId() : -1);
+        j.addProperty("last_server_tick", lastServerTick);
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null) {
+            return j;
+        }
+        j.addProperty("fps", client.getCurrentFps());
+        if (client.player != null) {
+            j.addProperty("selected_slot", client.player.getInventory().selectedSlot);
+            ItemStack stack = client.player.getMainHandStack();
+            j.addProperty("held_item", stack.isEmpty()
+                    ? "" : Registries.ITEM.getId(stack.getItem()).toString());
+        } else {
+            j.addProperty("selected_slot", -1);
+            j.addProperty("held_item", "");
+        }
+        // 准星瞄准方块（crosshairTarget 射线命中）
+        if (client.crosshairTarget instanceof BlockHitResult bhr) {
+            BlockPos p = bhr.getBlockPos();
+            j.addProperty("aimed_block_x", p.getX());
+            j.addProperty("aimed_block_y", p.getY());
+            j.addProperty("aimed_block_z", p.getZ());
+        }
+        // M11.5：准星瞄准实体（近战出剑门控——编排器只在准星实际套住目标实体时才
+        // 挥击，否则乱挥剑/剑砍到猪身前的方块）
+        if (client.crosshairTarget instanceof net.minecraft.util.hit.EntityHitResult ehr
+                && client.player != null) {
+            j.addProperty("aimed_entity", Registries.ENTITY_TYPE.getId(
+                    ehr.getEntity().getType()).toString());
+            j.addProperty("aimed_entity_dist",
+                    ehr.getEntity().distanceTo(client.player));
+        }
+        return j;
     }
 
     public static boolean isApiMode() {

@@ -5,6 +5,7 @@ import net.minecraft.client.util.Session;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.gen.Accessor;
+import org.spongepowered.asm.mixin.gen.Invoker;
 
 /**
  * M7：覆盖客户端 session 用户名（agent0 固定身份）。
@@ -20,4 +21,8 @@ public interface MinecraftClientAccessor {
     @Mutable
     @Accessor("session")
     void setSession(Session session);
+
+    /** API mode 下直接执行一次原版攻击逻辑，避免仅设置 attackKey 要等下一 tick。 */
+    @Invoker("doAttack")
+    boolean invokeDoAttack();
 }

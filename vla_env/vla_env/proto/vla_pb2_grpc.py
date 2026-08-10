@@ -96,6 +96,11 @@ class VlaServerStub:
                 request_serializer=vla__pb2.SetBlockRequest.SerializeToString,
                 response_deserializer=vla__pb2.Void.FromString,
                 _registered_method=True)
+        self.ShowPath = channel.unary_unary(
+                '/vla.VlaServer/ShowPath',
+                request_serializer=vla__pb2.ShowPathRequest.SerializeToString,
+                response_deserializer=vla__pb2.Void.FromString,
+                _registered_method=True)
 
 
 class VlaServerServicer:
@@ -187,6 +192,13 @@ class VlaServerServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ShowPath(self, request, context):
+        """路径可视化：在 A* 航点上刷粒子（demo 寻路展示；写操作，主线程执行）。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_VlaServerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -248,6 +260,11 @@ def add_VlaServerServicer_to_server(servicer, server):
             'SetBlock': grpc.unary_unary_rpc_method_handler(
                     servicer.SetBlock,
                     request_deserializer=vla__pb2.SetBlockRequest.FromString,
+                    response_serializer=vla__pb2.Void.SerializeToString,
+            ),
+            'ShowPath': grpc.unary_unary_rpc_method_handler(
+                    servicer.ShowPath,
+                    request_deserializer=vla__pb2.ShowPathRequest.FromString,
                     response_serializer=vla__pb2.Void.SerializeToString,
             ),
     }
@@ -576,6 +593,33 @@ class VlaServer:
             target,
             '/vla.VlaServer/SetBlock',
             vla__pb2.SetBlockRequest.SerializeToString,
+            vla__pb2.Void.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ShowPath(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vla.VlaServer/ShowPath',
+            vla__pb2.ShowPathRequest.SerializeToString,
             vla__pb2.Void.FromString,
             options,
             channel_credentials,

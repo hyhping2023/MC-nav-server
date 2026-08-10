@@ -31,7 +31,18 @@
 | `mode` | `mode: "api" \| "human"` | 切换输入模式；客户端同时清空按键状态（`KeyBinding.unpressAll()` 防"粘键"） | §5.4 / §9.2 |
 | `action` | §7.1 原始动作 dict（见 2.2） | 下发一步动作 | §9.2 |
 | `reset_camera` | `yaw`、`pitch` | 重置视角，例：`{"cmd":"reset_camera","yaw":0,"pitch":0}` | §6.3 |
+| `pillar_up` | `target_y?`、`max_blocks`、`item?` | 启动客户端垫方块爬高技能（M11，§5.7）：挖头顶 `fy+2` → 朝正下 → 跳 → 顶点放块 → 落地，循环。`target_y` 缺省 = 只受 `max_blocks` 约束；`item` 缺省 = 任意可放置方块。响应 `pillar_ok`，进度/终态经 `pillar_status` 上行 | §5.7 |
+| `pillar_cancel` | — | 停止垫方块爬高（幂等），响应 `pillar_cancel_ok` | §5.7 |
+| `goto_path` | `waypoints: [[x,y,z],…]`、`dig?: [{x,y,z,block?,tool?},…]` | 客户端本地路径跟随（NavExecutor）：跟服务端航点、航点间 LocalPathfinder 局部绕障/挖穿、按 `dig` 计划挖块（`tool` 标注则先切工具；未标注按方块挖掘 tag 自动选，M11.5 难点④）。终态经 `goto_status` 上行 | §17 |
+| `goto_cancel` | — | 取消本地导航并释放按键 | §17 |
+| `set_key_log` | `enabled: bool` | 开关 `key_event` 按键事件上行（录制用） | §11.3 |
+| `set_humanize` | `enabled: bool`、`seed: long` | M11.5：开关**执行器输出**的人类化整形（步态微松 30-60t/松 2-3t、挖掘节奏 40-80t/松 2t、非挖掘期 ±0.3° 镜头微漂）。同 seed 整形序列可复现。外部 `action` 与 PillarExecutor 输出**不整形**。响应 `humanize_ok` | §17.2 |
+| `set_tool_mode` | `mode: "auto" \| "melee" \| "none"` | M11.6：视线工具策略档位（ToolPolicy，按 crosshair 命中切换手持工具）。`melee`=无条件确保持剑（kill 任务，追击全程持剑）；`auto`=crosshair 命中触及范围内可挖方块→对应工具、命中近战范围内活体实体→剑（dig 任务）；`none`=不干预，技能自己选槽（place 任务，防 auto 把 dirt 槽换走）。挖穿/放置子模式与 pillar 进行中一律跳过。响应 `tool_mode_ok` | §17.9 |
 | `disconnect` | — | 断开 | §9.2 |
+
+> 目标方块高亮（M11.6 debug）走 **gRPC ShowPath**（红色 Dust + END_ROD 粒子）而非 WS：
+> 粒子由服务端刷进世界、渲染进抓帧画面（demo 视频可见），且与路径可视化共用同一机制
+> （见 DESIGN.md §17.10）。编排器选目标后 `show_path(goal=<目标块>)`，无目标/收尾 `clear`。
 
 ### 2.2 `action` 字段表（§7.1 原始动作，tick 级，MineRL/VPT 对齐）
 
@@ -51,10 +62,11 @@
 
 ### 2.3 上行（C→P）帧：二进制
 
-二进制消息头 + JPEG 载荷（§9.2 / P1.5）：
+二进制消息头 + JPEG 载荷（M11 起 23B 头，含帧采集时刻的按键状态——帧↔按键**按构造对齐**）：
 
 ```
-[4B frame_id][4B last_server_tick][8B wall_nanos][JPEG bytes]
+[4B frame_id][4B last_server_tick][8B wall_nanos]
+[2B buttons][1B hotbar][2B yaw_delta][2B pitch_delta][JPEG bytes]
 ```
 
 | 段 | 字节 | 说明 |
@@ -62,13 +74,37 @@
 | `frame_id` | 4B int | 帧序号（§9.2 记作 `frame_id`） |
 | `last_server_tick` | 4B int | 客户端最近一次经 `vla:tick` 收到的服务端 tick（§9.2 简记 `server_tick`，语义一致） |
 | `wall_nanos` | 8B long | 渲染墙钟时间（配合时钟漂移校正，§9.3） |
-| JPEG | 变长 | 224×224 无 HUD 第一人称帧（调试可用 Base64 JSON 代替） |
+| `buttons` | 2B | 11 按键位掩码（位序 = `action_space.BUTTONS`：forward=bit0 … inventory=bit10）；API 模式采样自当前注入动作，HUMAN 模式采样自真实键位 |
+| `hotbar` | 1B | 0-8；0xFF = 本帧无切换 |
+| `yaw_delta` / `pitch_delta` | 各 2B int16 | 相机增量定点（值 = 度 × 100），**相对上一个实际发出的帧**做差分（yaw 走最短角差）——流控丢帧的转角并入下一帧，∑Δ 严格等于视角终态−初态（M11.5 修复：老实现按渲染帧差分，丢帧连带丢转角）。Humanizer 镜头微漂如实体现 |
+| JPEG | 变长 | 第一人称帧（默认 224×224；`set_capture` 可切原生分辨率） |
+
+解析实现：`vla_env/vla_env/keys.py`（`HEADER_BYTES=23`、`decode_keys`）。
 
 ### 2.4 上行（C→P）状态：JSON
 
 `{"frame_id":.., "last_server_tick":.., "aimed_block":.., "held_item":.., "fps":..}`（§9.2）
 
 每帧上行消息携带：`{frame_id, last_server_tick, render_wall_time}`，Python 据此做帧↔tick 对齐（§5.6 / §9.3）。
+
+**事件类上行**（非帧，`drain_json` 消费）：
+
+| type | 字段 | 触发 |
+|---|---|---|
+| `goto_status` | `state`（arrived / blocked_breakable / blocked_wall / stuck）、`pos`、`wp`、`detail` | NavExecutor 终态 |
+| `path_debug` | `points`（客户端局部路径） | LocalPathfinder 产出新局部路径 |
+| `pillar_status` | `state`（progress / done / failed / cancelled）、`placed`、`feet_y`、`reason`、`detail` | PillarExecutor：`progress` 每垫成一块一条；其余为终态。`reason` ∈ head_blocked / no_block_item / out_of_blocks / in_fluid / no_settle / uneven_ground / place_failed / dig_timeout / timeout |
+
+**M11.5 追加语义**：
+
+- `state` 应答新增 `aimed_entity` / `aimed_entity_dist`（crosshairTarget 命中实体时的
+  注册名与距离）——近战**出剑门控**用：编排器只在准星实际套住目标实体且 ≤3.0m 时挥击
+  （防超距乱挥/剑砍到目标身前的方块，§17.8）。
+- `goto_cancel` / `pillar_cancel` / 技能终态的按键释放只清**电平键**，保留未消费的
+  一次性字段（hotbar/camera/drop/inventory）——修「cancel 紧跟 action{hotbar} 把选槽
+  吞掉」的调度竞争（§17.8 工具竞争）。
+- `goto_path` 执行期客户端可能自主**放置方块补落脚点**（LocalPathfinder place_step 边：
+  1 格深坑/1 格宽沟垫泥土，§17.8）；重规划带避让集（绕开失败走廊）。
 
 ---
 
@@ -143,7 +179,7 @@ Python
 | 项 | 约定 | 来源 |
 |---|---|---|
 | 挂载点 | `GameRendererMixin`（world 渲染之后、HUD 之前）→ 画面纯净（无准星/血条） | §5.5 |
-| 分辨率 | 默认 224×224（VLA 常用）；窗口比例 1:1（或中心裁切）避免非等比拉伸 FOV 畸变；`fov` 可配置（默认 70） | §5.5 |
+| 分辨率 | 默认 224×224（VLA 常用）；`set_capture` 显式 WxH 与游戏比例不一致时按源比例居中适配（letterbox 黑边），0=原生 framebuffer 分辨率（保留游戏原始比例） | §5.5 |
 | 帧率 | 客户端 60/120 FPS 渲染，采集端按 `record.fps`（默认 20，与 tick 对齐）降采样 | §5.5 |
 | 线程铁律 | 所有 GL 调用只在渲染线程；数据交递用无锁队列（`ConcurrentLinkedQueue`/MPSC ring buffer）；编码与网络传输放后台线程 | §5.5 / §14.1 |
 | 先通后优 | P1.4 抓帧先同步 `glReadPixels` 求通，P3.2 再换 PBO 异步 | §13 开发原则 |

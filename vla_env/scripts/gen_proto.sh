@@ -7,9 +7,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROTO_DIR="$SCRIPT_DIR/../proto"
 OUT_DIR="$SCRIPT_DIR/../vla_env/proto"
 
+# 优先用 venv python（系统 python 常缺 grpc_tools）
+if [ -x "$SCRIPT_DIR/../.venv/bin/python" ]; then
+  PY="$SCRIPT_DIR/../.venv/bin/python"
+else
+  PY=python
+fi
+
 mkdir -p "$OUT_DIR"
 
-python -m grpc_tools.protoc \
+"$PY" -m grpc_tools.protoc \
   -I "$PROTO_DIR" \
   --python_out="$OUT_DIR" \
   --grpc_python_out="$OUT_DIR" \
@@ -19,7 +26,7 @@ python -m grpc_tools.protoc \
 # 在 vla_env.proto 子包内无法解析，需改为相对导入。
 GRPC_FILE="$OUT_DIR/vla_pb2_grpc.py"
 if [ -f "$GRPC_FILE" ]; then
-  python - "$GRPC_FILE" <<'PY'
+  "$PY" - "$GRPC_FILE" <<'PY'
 import sys
 
 path = sys.argv[1]

@@ -1,6 +1,7 @@
 package dev.vla.client.mixin;
 
 import dev.vla.client.VlaClient;
+import dev.vla.client.input.KeyRecorder;
 import net.minecraft.client.Mouse;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -52,8 +53,22 @@ public abstract class MouseMixin {
 
     @Inject(method = "onMouseButton", at = @At("HEAD"), cancellable = true)
     private void vlaApiNoClick(long window, int button, int action, int mods, CallbackInfo ci) {
-        if (VlaClient.isApiMode()) {
-            ci.cancel();
+        // M11：HUMAN 模式 + 录制开启 → 记录真实鼠标点击（默认绑定 0=攻击 1=使用 2=拾取），
+        // 然后透明放行；API 模式照旧取消（物理鼠标隔离）。
+        if (!VlaClient.isApiMode()) {
+            if (KeyRecorder.isEnabled()) {
+                String key = switch (button) {
+                    case 0 -> "attack";
+                    case 1 -> "use";
+                    case 2 -> "middle";
+                    default -> null;
+                };
+                if (key != null) {
+                    KeyRecorder.record(key, action == 1, System.nanoTime());
+                }
+            }
+            return;
         }
+        ci.cancel();
     }
 }

@@ -18,6 +18,17 @@ message ResetRequest {
   int32 region_y = 5;
   int32 region_z = 6;
   int32 region_half_extent = 7;
+  // 初始物品覆盖（M11）：如 ["minecraft:diamond_pickaxe", "minecraft:dirt@64"]。
+  // 非空时覆盖任务默认 initialItems（hotbar 0-8 按序放置）。
+  repeated string items = 8;
+  // M11.5 自定义出生点（可选）：has_spawn=true 时传送到 (spawn_x, spawn_y, spawn_z)，
+  // 面向 spawn_yaw；否则用 world.getSpawnLocation()。基线快照区域也随 spawn 移动
+  //（region_* 未显式给出时以 spawn 为中心）。
+  bool has_spawn = 9;
+  double spawn_x = 10;
+  double spawn_y = 11;
+  double spawn_z = 12;
+  float spawn_yaw = 13;
 }
 
 message ResetReply {
@@ -82,9 +93,18 @@ message PathRequest {
   string cost_mode = 4; // 可选："default" | "no_jump" | "water"
 }
 
+// 动作级航点注解（NavV2）：action ∈ walk|jump|fall|dig|dig_down|place；
+// target 为需破坏/放置的方块坐标（仅 dig/dig_down/place 必填）。
+message Waypoint {
+  Vec3 pos = 1;      // 玩家脚格坐标（dig/dig_down 为源格，其余为目的格）
+  string action = 2;
+  Vec3 target = 3;
+}
+
 message PathReply {
-  repeated Vec3 waypoints = 1; // 拐点序列
+  repeated Vec3 waypoints = 1; // 拐点序列（纯位置，向后兼容）
   bool found = 2;
+  repeated Waypoint details = 3; // 动作级注解（NavV2）
 }
 
 message Vec3 {
@@ -115,6 +135,7 @@ message GenerateRequest {
   string player = 1;
   string prompt = 2;     // 课程/LLM 生成提示
   int32 difficulty = 3;
+  int32 seed = 4;        // 确定性种子（同 seed → 同任务；缺省 0 → 随机）
 }
 
 // ---- God Mode 世界控制 ----
@@ -148,6 +169,23 @@ message SetBlockRequest {
   Vec3 pos = 2;
   string block = 3; // 如 "minecraft:oak_log"
   bool apply_physics = 4;
+}
+
+// ---- 路径可视化（demo 寻路展示）----
+
+message ShowPathRequest {
+  string player = 1;
+  // A* 航点（方块坐标，服务端在方块中心刷粒子）；clear=true 时忽略。
+  repeated Vec3 waypoints = 2;
+  // 目标点（树/目标块），单独高亮（加亮粒子簇）；clear=true 时忽略。
+  Vec3 goal = 3;
+  // true → 清除该玩家当前路径特效（重算/结束时调用）。
+  bool clear = 4;
+  // 特效保持 tick（0 = 默认 1200，即 60s；新路径会覆盖旧路径）。
+  int32 lifetime_ticks = 5;
+  // 路径类型："server"=服务端长程航点（黄色）| "client"=客户端局部路径（白色）；
+  // 空/未设置默认 "server"。仅 waypoints 不为空时生效。
+  string path_type = 6;
 }
 
 // ---- 通信底座（M1）----
@@ -190,4 +228,6 @@ service VlaServer {
   rpc SpawnEntity(SpawnRequest) returns (Void);
   // 设置方块（God Mode）。
   rpc SetBlock(SetBlockRequest) returns (Void);
+  // 路径可视化：在 A* 航点上刷粒子（demo 寻路展示；写操作，主线程执行）。
+  rpc ShowPath(ShowPathRequest) returns (Void);
 }

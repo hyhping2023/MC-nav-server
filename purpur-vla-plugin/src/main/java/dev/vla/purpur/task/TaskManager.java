@@ -33,6 +33,9 @@ public final class TaskManager {
         public long steps = 0;
         /** 自上次 GetStepResult 结算以来累积的奖励，返回后清零。 */
         public double rewardSinceLastStep = 0;
+        /** M11.5 过度挖掘统计（难点③）：本 episode 挖掉的全部方块数 / 非目标方块数。 */
+        public int minedTotal = 0;
+        public int minedOffTarget = 0;
         public boolean success = false;
         public boolean timeout = false;
         public int lastStepTick = 0;
@@ -94,10 +97,20 @@ public final class TaskManager {
         if (st == null || st.task == null) {
             return;
         }
-        if ("block_mined".equals(st.task.successPredicate())
-                && blockKey.equals(TaskSpec.argStr(st.task.successArgs(), "block", ""))) {
+        // M11.5：全量挖掘计数（过度挖掘惩罚 + info 统计）。目标块计进度且永不惩罚；
+        // 非目标块按 TaskSpec.digPenalty 扣 reward（server-authoritative，§17.3 难点③）。
+        st.minedTotal++;
+        boolean isTarget = "block_mined".equals(st.task.successPredicate())
+                && blockKey.equals(TaskSpec.argStr(st.task.successArgs(), "block", ""));
+        if (isTarget) {
             st.bump("block_mined", blockKey);
             checkSuccess(player, st);
+        } else {
+            st.minedOffTarget++;
+            double penalty = st.task.digPenalty();
+            if (penalty > 0) {
+                st.rewardSinceLastStep -= penalty;
+            }
         }
     }
 
@@ -208,7 +221,9 @@ public final class TaskManager {
                 b.setTerminated(st.success)
                         .setTruncated(truncated)
                         .setProgress(progress(player, st))
-                        .putInfo("task", st.task.id());
+                        .putInfo("task", st.task.id())
+                        .putInfo("mined_total", Integer.toString(st.minedTotal))
+                        .putInfo("mined_offtarget", Integer.toString(st.minedOffTarget));
             }
             observer.onNext(b.build());
             observer.onCompleted();

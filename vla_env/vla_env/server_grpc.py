@@ -77,14 +77,20 @@ class ServerGrpc:
         task: Optional[str] = None,
         seed: Optional[int] = None,
         region: Optional[Dict[str, Any]] = None,
+        items: Optional[Sequence[str]] = None,
+        spawn: Optional[Sequence[float]] = None,
     ) -> Dict[str, Any]:
         """ResetWorld：重置世界（区域回滚 + 玩家态），返回 ResetReply。
 
         参数：
         - player: 玩家名（缺省用 self.player）
         - task: 任务 id（服务端 resetWorld 当前不使用，任务经 set_task 设置）
-        - seed: 世界/任务种子（int）
+        - seed: 世界/任务种子（int；M11 起服务端存入 ResetSpec 供回放校验）
         - region: 可选 dict {x, y, z, half_extent} 指定重置区域中心与半宽
+        - items: M11 初始物品覆盖，如 ["minecraft:diamond_pickaxe", "minecraft:dirt@64"]，
+          非空时覆盖任务默认 initialItems（固定工具包）
+        - spawn: M11.5 自定义出生点 (x, y, z[, yaw])——重置传送到此处（难点③）；
+          区域未显式给出时以 spawn 为中心
 
         返回 {"server_tick", "ok", "message"}（message 为区域 checksum）。
         """
@@ -93,6 +99,15 @@ class ServerGrpc:
             req.task = task
         if seed is not None:
             req.seed = int(seed)
+        if items:
+            req.items.extend(str(i) for i in items)
+        if spawn is not None:
+            req.has_spawn = True
+            req.spawn_x = float(spawn[0])
+            req.spawn_y = float(spawn[1])
+            req.spawn_z = float(spawn[2])
+            if len(spawn) > 3:
+                req.spawn_yaw = float(spawn[3])
         if region:
             if region.get("x") is not None:
                 req.region_x = int(region["x"])
@@ -203,15 +218,18 @@ class ServerGrpc:
         goal: Optional[Sequence[float]] = None,
         start: Optional[Sequence[float]] = None,
         cost_mode: str = "default",
-    ) -> List[Tuple[float, float, float]]:
-        """ComputePath：服务端 3D A* 寻路。
+    ) -> Tuple[List[Tuple[float, float, float]], List[Dict[str, Any]]]:
+        """ComputePath：服务端动作级 3D A* 寻路（NavV2）。
 
         参数：
         - goal: (x, y, z) 目标世界坐标（必填）
         - start: (x, y, z) 起点；缺省用玩家当前位置
-        - cost_mode: "default" | "no_jump" | "water"
+        - cost_mode: "default"（不挖穿）| "dig"（挖穿/下挖）| "place"（+垫方块爬高）
 
-        返回航点列表 [(x,y,z), ...]（拐点序列）；未找到路径返回空列表。
+        返回 (waypoints, details)：
+        - waypoints: 拐点序列 [(x,y,z), ...]（纯位置，向后兼容）；未找到为空列表
+        - details: 动作级航点 [{pos, action, target}, ...]，action ∈
+          walk|jump|fall|dig|dig_down|place；target 仅 dig/dig_down/place 非空。
         """
         req = vla_pb2.PathRequest(
             player=player or self.player, cost_mode=cost_mode or "default"
@@ -225,7 +243,16 @@ class ServerGrpc:
                 vla_pb2.Vec3(x=float(start[0]), y=float(start[1]), z=float(start[2]))
             )
         reply: vla_pb2.PathReply = self.stub.ComputePath(req)
-        return [(w.x, w.y, w.z) for w in reply.waypoints]
+        waypoints = [(w.x, w.y, w.z) for w in reply.waypoints]
+        details = [
+            {
+                "pos": (d.pos.x, d.pos.y, d.pos.z),
+                "action": d.action,
+                "target": None if not d.HasField("target") else (d.target.x, d.target.y, d.target.z),
+            }
+            for d in reply.details
+        ]
+        return waypoints, details
 
     # ---- 课程 / God Mode（M12 / 预留）----
 
@@ -234,11 +261,18 @@ class ServerGrpc:
         player: Optional[str] = None,
         prompt: str = "",
         difficulty: int = 0,
+        seed: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """GenerateTask：课程/LLM 生成任务（服务端当前返回注册表随机任务占位）。"""
+        """GenerateTask：课程/LLM 生成任务（M11 起支持确定性 seed）。
+
+        seed != 0 时服务端用 java.util.Random(seed) 从注册表确定性选任务
+        （同 seed → 同任务，支撑种子回放）；seed=0 回退随机。
+        """
         req = vla_pb2.GenerateRequest(
             player=player or self.player, prompt=prompt, difficulty=int(difficulty)
         )
+        if seed is not None:
+            req.seed = int(seed)
         reply: vla_pb2.TaskReply = self.stub.GenerateTask(req)
         return {
             "id": reply.id,
@@ -278,7 +312,7 @@ class ServerGrpc:
         yaw: float = 0.0,
         pitch: float = 0.0,
     ) -> None:
-        """Teleport：传送玩家（服务端尚未实现，会抛 UNIMPLEMENTED）。"""
+        """Teleport：传送玩家（God Mode；M12 已实现，主线程调度）。"""
         req = vla_pb2.TeleportRequest(
             player=player or self.player, yaw=float(yaw), pitch=float(pitch)
         )
@@ -295,7 +329,7 @@ class ServerGrpc:
         pos: Optional[Sequence[float]] = None,
         count: int = 1,
     ) -> None:
-        """SpawnEntity：生成实体（服务端尚未实现，会抛 UNIMPLEMENTED）。"""
+        """SpawnEntity：生成实体（服务端已实现，God Mode）。"""
         req = vla_pb2.SpawnRequest(
             player=player or self.player,
             entity_type=entity_type,
@@ -325,6 +359,39 @@ class ServerGrpc:
                 vla_pb2.Vec3(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
             )
         self.stub.SetBlock(req)
+
+    def show_path(
+        self,
+        player: Optional[str] = None,
+        waypoints: Optional[Sequence[Sequence[float]]] = None,
+        goal: Optional[Sequence[float]] = None,
+        clear: bool = False,
+        lifetime_ticks: int = 0,
+        path_type: str = "server",
+    ) -> None:
+        """ShowPath：路径可视化（两层导航 M10）。
+
+        参数：
+        - waypoints: 方块整数坐标序列 [(x,y,z), ...]（服务端在方块中心刷粒子）
+        - goal: 目标方块坐标 (x,y,z)，单独高亮（目标树定位）
+        - clear: True 时清除该玩家当前路径特效（忽略 waypoints/goal）
+        - lifetime_ticks: 特效保留 tick（0 = 默认 1200，即 60s）
+        - path_type: "server"（默认，黄色 Dust 服务端长程航点）| "client"（白色 Dust 客户端局部路径）
+        """
+        req = vla_pb2.ShowPathRequest(
+            player=player or self.player,
+            clear=clear,
+            lifetime_ticks=int(lifetime_ticks),
+            path_type=path_type or "server",
+        )
+        if not clear:
+            for w in waypoints or []:
+                req.waypoints.add(x=float(w[0]), y=float(w[1]), z=float(w[2]))
+            if goal is not None:
+                req.goal.CopyFrom(
+                    vla_pb2.Vec3(x=float(goal[0]), y=float(goal[1]), z=float(goal[2]))
+                )
+        self.stub.ShowPath(req)
 
     def close(self) -> None:
         """关闭 gRPC 通道（M1 已实现）。"""

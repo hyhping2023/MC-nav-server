@@ -26,7 +26,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * - ping → {"type":"pong","ts":<epoch_ms>,"api_mode":<bool>}
  * - {"cmd":"mode","mode":"api"|"human"} → 回调 onModeChange + {"type":"mode_ok","mode":...}
  * - {"cmd":"set_capture_ui","hud":true|false} → 回调 onSetCaptureUi + {"type":"capture_ui_ok","hud":...}
- * - {"cmd":"set_turn_speed","deg":40.0} → 回调 onSetTurnSpeed + {"type":"turn_speed_ok","deg":...}
+ * - {@code {"cmd":"set_turn_speed","deg":40.0}} → 回调 onSetTurnSpeed + {"type":"turn_speed_ok","deg":...}
+ * - {@code {"cmd":"pillar_up","target_y":72,"max_blocks":8,"item":"minecraft:dirt"}}
+ *   → 回调 onPillarUp + {"type":"pillar_ok",...}；进度/结束经 pillar_status 上行
+ * - {@code {"cmd":"pillar_cancel"}} → 回调 onPillarCancel + {"type":"pillar_cancel_ok"}
+ * - {@code {"cmd":"set_humanize","enabled":true,"seed":42}} → 回调 onSetHumanize + {"type":"humanize_ok",...}
+ * - {@code {"cmd":"set_tool_mode","mode":"auto"|"melee"|"none"}} → 回调 onSetToolMode + {"type":"tool_mode_ok",...}
  * - {"cmd":"disconnect"} → {"type":"bye"} + 关闭会话
  * - 未知 cmd / 非法 JSON / 非法 mode → {"type":"error","message":...}
  */
@@ -69,12 +74,43 @@ public class WsServer extends WebSocketServer {
         default void onSetTurnSpeed(double degPerTick) {
         }
 
-        /** M9.3：收到本地导航航点（有序方块坐标 [x,y,z]，来自服务端 A* 的 walk/jump/fall 位置）。 */
-        default void onGotoPath(List<int[]> waypoints) {
+        /** M9.3：收到本地导航航点（有序方块坐标 [x,y,z]，来自服务端 A* 的 walk/jump/fall 位置）。
+         *  digTargets=计划要挖的方块（客户端只挖这些，杜绝乱挖掘）。每元素 JsonObject：
+         *  {@code {x,y,z}} 或 {@code {x,y,z,block:"minecraft:stone",tool:"diamond_pickaxe"}}
+         *  ——block/tool 由规划器标注，客户端据此切工具（老格式无 tool → 客户端按方块自动判断）。 */
+        default void onGotoPath(List<int[]> waypoints, List<JsonObject> digTargets) {
         }
 
         /** M9.3：取消本地导航。 */
         default void onGotoCancel() {
+        }
+
+        /** M11：启动客户端垫方块爬高技能（pillar-up）。
+         *  targetY=目标脚格 Y（{@link Integer#MIN_VALUE} = 只按 maxBlocks 停）；
+         *  item=垫块材料注册名（null = 任意可放置方块）。 */
+        default void onPillarUp(int targetY, int maxBlocks, String item) {
+        }
+
+        /** M11：取消垫方块爬高。 */
+        default void onPillarCancel() {
+        }
+
+        /** M11：WS `state` 请求 → 状态 JSON（frame_id/aimed_block/held_item/fps/selected_slot）；
+         *  null = 不可用（VlaClient 构造，含 crosshairTarget 射线）。 */
+        default JsonObject onStateRequest() {
+            return null;
+        }
+
+        /** M11：开关 key_event 按键事件上行（人类演示录制）。 */
+        default void onSetKeyLog(boolean enabled) {
+        }
+
+        /** M11.5：开关执行器输出的人类化整形（步态微松/挖掘节奏/镜头微漂）；同 seed 可复现。 */
+        default void onSetHumanize(boolean enabled, long seed) {
+        }
+
+        /** M11.6：视线工具策略档位（auto/melee/none），由编排器按任务下发（kill→melee、dig→auto、place→none）。 */
+        default void onSetToolMode(String mode) {
         }
     }
 
@@ -275,16 +311,92 @@ public class WsServer extends WebSocketServer {
                         }
                     }
                 }
-                handler.onGotoPath(wps);
+                // 可选 dig 列表：服务端/规划器计划要挖的方块（客户端只挖这些）。
+                // 元素兼容两种格式：
+                //   - 数组 [x, y, z]（老格式，无工具信息 → 客户端按方块自动判断工具）
+                //   - 对象 {"x":..,"y":..,"z":..,"block":"minecraft:stone","tool":"diamond_pickaxe"}
+                List<JsonObject> digs = new ArrayList<>();
+                if (obj.has("dig") && obj.get("dig").isJsonArray()) {
+                    for (com.google.gson.JsonElement e : obj.getAsJsonArray("dig")) {
+                        if (e.isJsonObject()) {
+                            digs.add(e.getAsJsonObject());
+                        } else if (e.isJsonArray() && e.getAsJsonArray().size() >= 3) {
+                            JsonArray pt = e.getAsJsonArray();
+                            JsonObject o = new JsonObject();
+                            o.addProperty("x", pt.get(0).getAsInt());
+                            o.addProperty("y", pt.get(1).getAsInt());
+                            o.addProperty("z", pt.get(2).getAsInt());
+                            digs.add(o);
+                        }
+                    }
+                }
+                handler.onGotoPath(wps, digs);
                 JsonObject ok = new JsonObject();
                 ok.addProperty("type", "goto_ok");
                 ok.addProperty("waypoints", wps.size());
+                ok.addProperty("dig", digs.size());
                 conn.send(GSON.toJson(ok));
             }
             case "goto_cancel" -> {
                 handler.onGotoCancel();
                 JsonObject ok = new JsonObject();
                 ok.addProperty("type", "goto_cancel_ok");
+                conn.send(GSON.toJson(ok));
+            }
+            case "pillar_up" -> {
+                // 垫方块爬高：挖头顶 → 朝正下 → 跳 → 顶点放块 → 落地 → 循环。
+                // target_y 缺省 = 不按高度停（只受 max_blocks 约束）。
+                int targetY = obj.has("target_y") && !obj.get("target_y").isJsonNull()
+                        ? obj.get("target_y").getAsInt() : Integer.MIN_VALUE;
+                int maxBlocks = obj.has("max_blocks") ? obj.get("max_blocks").getAsInt() : 8;
+                String item = obj.has("item") && !obj.get("item").isJsonNull()
+                        ? obj.get("item").getAsString() : null;
+                handler.onPillarUp(targetY, maxBlocks, item);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "pillar_ok");
+                ok.addProperty("target_y", targetY);
+                ok.addProperty("max_blocks", maxBlocks);
+                ok.addProperty("item", item == null ? "" : item);
+                conn.send(GSON.toJson(ok));
+            }
+            case "pillar_cancel" -> {
+                handler.onPillarCancel();
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "pillar_cancel_ok");
+                conn.send(GSON.toJson(ok));
+            }
+            case "state" -> {
+                JsonObject st = handler.onStateRequest();
+                if (st == null) {
+                    sendError(conn, "state unavailable");
+                    break;
+                }
+                conn.send(GSON.toJson(st));
+            }
+            case "set_key_log" -> {
+                boolean on = obj.has("enabled") && obj.get("enabled").getAsBoolean();
+                handler.onSetKeyLog(on);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "key_log_ok");
+                ok.addProperty("enabled", on);
+                conn.send(GSON.toJson(ok));
+            }
+            case "set_humanize" -> {
+                boolean on = obj.has("enabled") && obj.get("enabled").getAsBoolean();
+                long seed = obj.has("seed") ? obj.get("seed").getAsLong() : 0L;
+                handler.onSetHumanize(on, seed);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "humanize_ok");
+                ok.addProperty("enabled", on);
+                ok.addProperty("seed", seed);
+                conn.send(GSON.toJson(ok));
+            }
+            case "set_tool_mode" -> {
+                String mode = obj.has("mode") ? obj.get("mode").getAsString() : "auto";
+                handler.onSetToolMode(mode);
+                JsonObject ok = new JsonObject();
+                ok.addProperty("type", "tool_mode_ok");
+                ok.addProperty("mode", mode);
                 conn.send(GSON.toJson(ok));
             }
             default -> sendError(conn, "unknown cmd: " + cmd);

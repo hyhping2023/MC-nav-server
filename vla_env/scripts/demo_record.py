@@ -49,14 +49,18 @@ def recorder(ws, outdir, stop_flag) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="collect_wood 第一视角 demo 录制（A* 导航）")
+    p = argparse.ArgumentParser(description="第一视角 demo 录制（A* 导航）")
     p.add_argument("outdir", help="帧输出目录（JPEG）")
+    p.add_argument("--task", choices=["collect_wood", "collect_stone", "kill_animal"],
+                   default="collect_wood",
+                   help="任务：collect_wood/collect_stone/kill_animal")
     p.add_argument("--max-steps", type=int, default=600)
     p.add_argument("--ticks", type=int, default=2)
     p.add_argument("--half-extent", type=int, default=16)
     p.add_argument("--player", default="agent0")
     p.add_argument("--capture", default="native",
-                   help="抓帧分辨率：native=游戏原始分辨率（保真+保留比例，推荐）或 WxH 如 1280x720")
+                   help="抓帧分辨率：native=游戏 framebuffer 原始分辨率（保留游戏比例，推荐）"
+                        "或 WxH 如 1280x720（按游戏比例居中适配，黑边 letterbox，不拉伸）")
     p.add_argument("--no-hud", action="store_true",
                    help="关闭 HUD 抓帧（默认开启：demo 视频含物品栏/血条/手/准星；"
                         "VLA 观测请用 --no-hud 保持纯净画面）")
@@ -67,7 +71,7 @@ def main() -> int:
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    env = MinecraftEnv(player=args.player, task="collect_wood", ticks_per_step=args.ticks)
+    env = MinecraftEnv(player=args.player, task=args.task, ticks_per_step=args.ticks)
     try:
         obs = None
         for attempt in range(30):
@@ -83,6 +87,11 @@ def main() -> int:
             return 1
         print(f"[reset] OK pos={obs['player']['pos']}", flush=True)
 
+        # kill_animal：reset 后生成猪（只生成一次；策略循环自身 get_state 扫描）
+        if args.task == "kill_animal":
+            env.grpc.spawn_entity(player=args.player, entity_type="minecraft:pig", count=2)
+            time.sleep(0.5)
+
         # 切换抓帧分辨率（native → 游戏 framebuffer 原始分辨率，保真+保留比例）
         if args.capture.lower() == "native":
             env.ws.send({"cmd": "set_capture", "width": 0, "height": 0})
@@ -90,6 +99,12 @@ def main() -> int:
             w, h = (int(x) for x in args.capture.lower().split("x"))
             env.ws.send({"cmd": "set_capture", "width": w, "height": h})
         time.sleep(0.5)  # 等客户端渲染线程重建 FBO
+
+        # 排空 set_capture 前积压的旧分辨率帧（首帧可能是切换前的默认 224，
+        # 混入会让 ffmpeg 按首帧尺寸定视频大小）
+        for _ in range(20):
+            if env.ws.recv_frame(timeout=0.5) is None:
+                break
 
         # M9.1：demo 视频需要完整 UI（HUD+手+准星）——切到 GameRenderer TAIL 抓帧；
         # 与 set_capture native 兼容（HUD 抓帧独立于分辨率）。
@@ -111,7 +126,7 @@ def main() -> int:
 
         ok, steps, max_progress = collect_wood_policy(
             env, step_fn, max_steps=args.max_steps, ticks=args.ticks,
-            half_extent=args.half_extent)
+            half_extent=args.half_extent, task=args.task)
 
         # 收尾：停录帧，稍等帧流排空
         time.sleep(0.5)

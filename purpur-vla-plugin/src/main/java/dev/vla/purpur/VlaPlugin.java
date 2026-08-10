@@ -1,8 +1,9 @@
 package dev.vla.purpur;
 
+import dev.vla.purpur.debug.PathVisualizer;
 import dev.vla.purpur.grpc.MainThreadDispatcher;
 import dev.vla.purpur.grpc.VlaGrpcService;
-import dev.vla.purpur.path.AStar;
+import dev.vla.purpur.path.DirectPathPlanner;
 import dev.vla.purpur.player.AgentManager;
 import dev.vla.purpur.reset.ResetEngine;
 import dev.vla.purpur.task.TaskManager;
@@ -53,6 +54,7 @@ public class VlaPlugin extends JavaPlugin implements Listener {
     private AgentManager agentManager;
     private ResetEngine resetEngine;
     private TaskManager taskManager;
+    private PathVisualizer pathVisualizer;
 
     @Override
     public void onEnable() {
@@ -61,9 +63,18 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         this.agentManager = new AgentManager(this);
         this.resetEngine = new ResetEngine();
         this.taskManager = new TaskManager(this);
+        this.pathVisualizer = new PathVisualizer(this);
         Bukkit.getPluginManager().registerEvents(agentManager, this);
         // M5：任务相关事件（方块破坏/放置、实体死亡、玩家移动 → TaskManager 判定）
         Bukkit.getPluginManager().registerEvents(this, this);
+
+        // M11.5：data-driven 任务（难点②）——plugins/VlaPlugin/tasks/*.json，
+        // 同 id 覆盖内置；`vla reloadtasks` 热重载。
+        int loaded = dev.vla.purpur.task.TaskRegistry.loadFromDir(
+                new java.io.File(getDataFolder(), "tasks"), getLogger());
+        if (loaded > 0) {
+            getLogger().info("[task] loaded " + loaded + " JSON task(s)");
+        }
 
         // M8：vla:tick 频道（§5.6）——每 tick 向在线玩家广播权威 server_tick + 墙钟，
         // 客户端据此给帧打 last_server_tick，供 Python lockstep 对齐（§9.3）。
@@ -121,6 +132,11 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         return taskManager;
     }
 
+    /** demo 路径可视化（A* 航点粒子特效，gRPC ShowPath）。 */
+    public PathVisualizer getPathVisualizer() {
+        return pathVisualizer;
+    }
+
     /**
      * M8：每 tick 向所有在线玩家广播 `vla:tick` payload（主线程，runTaskTimer 1L）。
      *
@@ -166,6 +182,13 @@ public class VlaPlugin extends JavaPlugin implements Listener {
                 return vlaVoxels(sender, args);
             case "path":
                 return vlaPath(sender, args);
+            case "reloadtasks": {
+                int n = dev.vla.purpur.task.TaskRegistry.loadFromDir(
+                        new java.io.File(getDataFolder(), "tasks"), getLogger());
+                sender.sendMessage("[vla-purpur] reloadtasks: loaded " + n + " JSON task(s), "
+                        + dev.vla.purpur.task.TaskRegistry.all().size() + " total");
+                return true;
+            }
             default:
                 usage(sender);
                 return true;
@@ -175,7 +198,7 @@ public class VlaPlugin extends JavaPlugin implements Listener {
     private void usage(CommandSender sender) {
         sender.sendMessage("Usage: /vla status | /vla reset <player> [halfExtent] | /vla verify <player>"
                 + " | /vla task <player> <task> | /vla taskinfo <player>"
-                + " | /vla voxels <player> [r] | /vla path <x> <y> <z>");
+                + " | /vla voxels <player> [r] | /vla path <x> <y> <z> [mode] | /vla reloadtasks");
     }
 
     /** {@code /vla status}：输出 tick/tps/gRPC 端口（保留 M1）。 */
@@ -291,7 +314,7 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         TaskSpec spec = taskManager.setTask(player, args[2]);
         if (spec == null) {
             sender.sendMessage("[vla-purpur] task: unknown task: " + args[2]
-                    + " (known: collect_wood, craft_planks)");
+                    + " (known: collect_wood, craft_planks, collect_stone, kill_animal)");
             return true;
         }
         sender.sendMessage(String.format("[vla-purpur] task %s set: id=%s instruction=\"%s\" timeout=%d",
@@ -360,10 +383,10 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         return true;
     }
 
-    /** {@code /vla path <x> <y> <z>}：以执行者为起点寻路到目标，打印航点数/首尾点。 */
+    /** {@code /vla path <x> <y> <z> [mode]}：以执行者为起点寻路到目标，打印航点数/动作序列。 */
     private boolean vlaPath(CommandSender sender, String[] args) {
         if (args.length < 4) {
-            sender.sendMessage("Usage: /vla path <x> <y> <z>");
+            sender.sendMessage("Usage: /vla path <x> <y> <z> [mode: default|dig|place]");
             return true;
         }
         Player player;
@@ -380,10 +403,11 @@ public class VlaPlugin extends JavaPlugin implements Listener {
             int x = Integer.parseInt(args[1]);
             int y = Integer.parseInt(args[2]);
             int z = Integer.parseInt(args[3]);
+            String mode = args.length >= 5 ? args[4] : "default";
             Location loc = player.getLocation();
-            AStar.PathResult result = AStar.findPath(player.getWorld(),
+            DirectPathPlanner.PathResult result = DirectPathPlanner.findPath(player.getWorld(),
                     new BlockVector(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ()),
-                    new BlockVector(x, y, z), "default");
+                    new BlockVector(x, y, z), mode);
             if (!result.found) {
                 sender.sendMessage("[vla-purpur] path: not found (expanded=" + result.expanded + ")");
                 return true;
@@ -393,6 +417,20 @@ public class VlaPlugin extends JavaPlugin implements Listener {
                     ? "<none>" : result.waypoints.get(result.waypoints.size() - 1).toString();
             sender.sendMessage(String.format("[vla-purpur] path found=%b waypoints=%d first=%s last=%s expanded=%d",
                     result.found, result.waypoints.size(), first, last, result.expanded));
+            // Oracle 改造：动作级航点恒为空（details 空列表），此行保留兼容循环
+            StringBuilder sb = new StringBuilder("[vla-purpur] actions: ");
+            for (DirectPathPlanner.Waypoint w : result.details) {
+                if (w.target != null) {
+                    sb.append(w.action).append('(').append(w.target.getBlockX())
+                            .append(',').append(w.target.getBlockY()).append(',')
+                            .append(w.target.getBlockZ()).append(") ");
+                } else {
+                    sb.append(w.action).append(' ').append(w.pos.getBlockX())
+                            .append(',').append(w.pos.getBlockY()).append(',')
+                            .append(w.pos.getBlockZ()).append("  ");
+                }
+            }
+            sender.sendMessage(sb.toString());
             return true;
         } catch (NumberFormatException e) {
             sender.sendMessage("[vla-purpur] path: bad coords");

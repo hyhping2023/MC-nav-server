@@ -1,0 +1,17 @@
+{
+  "id": "collect_sand",
+  "instruction": "Collect 4 sand blocks with a shovel.",
+  "instruction_zh": "用铲子挖 4 个沙子。",
+  "type": "COLLECT",
+  "difficulty": 1,
+  "predicate": "block_mined",
+  "args": {"block": "minecraft:sand", "count": 4},
+  "timeout_ticks": 6000,
+  "items": [
+    "minecraft:diamond_pickaxe",
+    "minecraft:diamond_sword",
+    "minecraft:diamond_shovel",
+    "minecraft:dirt@64"
+  ],
+  "dig_penalty": 0.05
+}

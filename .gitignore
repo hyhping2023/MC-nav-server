@@ -28,4 +28,4 @@ __pycache__/
 /.codebuddy/
 
 # demo 视频等生成产物（磁盘保留不入库）
-/datasets/demo/
+/datasets/

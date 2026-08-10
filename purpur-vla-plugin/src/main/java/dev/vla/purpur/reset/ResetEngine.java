@@ -41,6 +41,8 @@ public final class ResetEngine {
         public final List<ItemStack> initialItems = new ArrayList<>();
         /** 固定时间（time of day，默认 6000 = 正午）。 */
         public long time = 6000;
+        /** M11 确定性种子（ResetRequest.seed）：记录用于回放校验/日志，本身不改变地形。 */
+        public int seed = 0;
 
         public void setCenter(int x, int y, int z) {
             this.centerX = x;
@@ -138,11 +140,23 @@ public final class ResetEngine {
         world.setStorm(false);
         world.setThundering(false);
 
-        // 7. 初始物品（先 clear 再加）
-        for (ItemStack item : spec.initialItems) {
-            if (item != null) {
-                player.getInventory().addItem(item);
+        // 7. 初始物品（先 clear 再加）：前 9 个显式放入 hotbar 0-8（确定性槽位），
+        //    超出部分 addItem；存在初始物品时选中槽归零（镐 0），避免上一 episode 选中槽残留。
+        ItemStack[] initial = spec.initialItems.toArray(new ItemStack[0]);
+        for (int i = 0; i < initial.length && i < 9; i++) {
+            if (initial[i] != null) {
+                player.getInventory().setItem(i, initial[i]);
             }
+        }
+        if (initial.length > 9) {
+            for (int i = 9; i < initial.length; i++) {
+                if (initial[i] != null) {
+                    player.getInventory().addItem(initial[i]);
+                }
+            }
+        }
+        if (initial.length > 0) {
+            player.getInventory().setHeldItemSlot(0);
         }
 
         return new ResetResult(true, snapshot.checksum(), Bukkit.getCurrentTick(),

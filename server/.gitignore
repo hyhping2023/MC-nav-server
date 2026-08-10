@@ -4,10 +4,13 @@ versions/
 libraries/
 cache/
 
-# 世界数据
+# 世界数据（含旧世界备份）
 world/
 world_nether/
 world_the_end/
+world_old*/
+world_nether_old*/
+world_the_end_old*/
 
 # 日志
 logs/

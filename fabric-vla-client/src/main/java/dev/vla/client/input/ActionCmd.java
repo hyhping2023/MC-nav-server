@@ -30,6 +30,26 @@ public class ActionCmd {
     /** 视角增量 {@code {pitchDelta, yawDelta}}（度）。 */
     public final float[] camera = {0.0f, 0.0f};
 
+    /** M11：浅拷贝（KeyRecorder diff 前后注入动作用；一次性字段会随 apply 清零）。 */
+    public ActionCmd copy() {
+        ActionCmd c = new ActionCmd();
+        c.forward = forward;
+        c.back = back;
+        c.left = left;
+        c.right = right;
+        c.jump = jump;
+        c.sneak = sneak;
+        c.sprint = sprint;
+        c.attack = attack;
+        c.use = use;
+        c.drop = drop;
+        c.inventory = inventory;
+        c.hotbar = hotbar;
+        c.camera[0] = camera[0];
+        c.camera[1] = camera[1];
+        return c;
+    }
+
     public static ActionCmd fromJson(JsonObject obj) {
         ActionCmd cmd = new ActionCmd();
         cmd.forward = getBool(obj, "forward");

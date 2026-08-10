@@ -1,6 +1,7 @@
 package dev.vla.client.gfx;
 
 import dev.vla.client.VlaClient;
+import dev.vla.client.input.KeyRecorder;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.GL11;
@@ -18,9 +19,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 读出 RGBA 并上下翻转（GL 左下原点 → 图像左上原点），打包成 {@link FrameData}
  * 进无锁队列；JPEG 编码与 WS 上行放在后台线程 {@code FrameSender}（渲染线程零编码）。
  *
- * <p>帧头协议（DESIGN.md §9.2）：frame_id 由本类单调递增；lastServerTick 为 M8 经
- * vla:tick 插件消息缓存的服务端权威 tick（VlaClient.getLastServerTick）；wallNanos 取
- * 采集时刻墙钟。
+ * <p>帧头协议（DESIGN.md §9.2 / docs/p1_protocol.md §2.3）：frame_id 由本类单调递增；
+ * lastServerTick 为 M8 经 vla:tick 插件消息缓存的服务端权威 tick（VlaClient.getLastServerTick）；
+ * wallNanos 取采集时刻墙钟。M11：帧头附带按键位掩码 + 选中槽 + 相机增量（KeyState），
+ * 实现帧↔按键按构造对齐（每帧自带采集时刻的按键状态）。
  */
 public final class FrameGrabber {
 
@@ -43,6 +45,11 @@ public final class FrameGrabber {
 
     public FrameGrabber(ConcurrentLinkedQueue<FrameData> queue) {
         this.queue = queue;
+    }
+
+    /** M11：最近一次已采集的帧号（未采集过返回 -1）；WS state 上行标注用。 */
+    public int getLastFrameId() {
+        return frameId.get() - 1;
     }
 
     /** 运行时切换抓帧分辨率（WS set_capture 回调；渲染线程调用）。0 = 原生 framebuffer 尺寸。 */
@@ -88,7 +95,7 @@ public final class FrameGrabber {
     public void capture() {
         MinecraftClient client = MinecraftClient.getInstance();
         Framebuffer main = client.getFramebuffer();
-        if (main == null || client.world == null) {
+        if (main == null || client.world == null || client.player == null) {
             return;
         }
         int srcW = main.textureWidth;
@@ -106,11 +113,25 @@ public final class FrameGrabber {
             init(cw, ch); // 分辨率切换 → 重建 FBO
         }
 
-        // 主缓冲 → cw×ch 小 FBO（GPU 下采样；同尺寸时即 1:1 拷贝）
+        // 主缓冲 → cw×ch 小 FBO（GPU 下采样）
         GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, main.fbo);
         GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, fboId);
-        GL30.glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, cw, ch,
-                GL11.GL_COLOR_BUFFER_BIT, GL11.GL_LINEAR);
+        if (targetWidth > 0 && targetHeight > 0 && (cw != srcW || ch != srcH)) {
+            // 显式尺寸：按源比例居中适配（letterbox 黑边），不拉伸游戏画面
+            double scale = Math.min((double) cw / srcW, (double) ch / srcH);
+            int dw = Math.max(1, (int) Math.floor(srcW * scale));
+            int dh = Math.max(1, (int) Math.floor(srcH * scale));
+            int dx = (cw - dw) / 2;
+            int dy = (ch - dh) / 2;
+            GL11.glClearColor(0f, 0f, 0f, 1f);
+            GL11.glClear(GL11.GL_COLOR_BUFFER_BIT);
+            GL30.glBlitFramebuffer(0, 0, srcW, srcH, dx, dy, dx + dw, dy + dh,
+                    GL11.GL_COLOR_BUFFER_BIT, GL11.GL_LINEAR);
+        } else {
+            // native（target 0）或同尺寸：整幅拷贝
+            GL30.glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, cw, ch,
+                    GL11.GL_COLOR_BUFFER_BIT, GL11.GL_LINEAR);
+        }
 
         // 小 FBO → CPU 读回 RGBA
         GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, fboId);
@@ -134,8 +155,25 @@ public final class FrameGrabber {
         // 尚未收到广播（-1）时回退 0，避免写入 unsigned 全 1 破坏对齐统计）
         long tick = VlaClient.getLastServerTick();
         int lastServerTick = (tick >= 0 && tick <= Integer.MAX_VALUE) ? (int) tick : 0;
-        queue.add(new FrameData(rgba, cw, ch, frameId.getAndIncrement(),
-                System.nanoTime(), lastServerTick));
+
+        // M11：采集帧号先写入 KeyRecorder（key_event 标注归属帧），再采样按键状态。
+        // 按键状态 = 帧采集时刻的注入/真实按键位掩码 + 选中槽 + 帧间相机增量。
+        int fid = frameId.getAndIncrement();
+        KeyRecorder.setLastFrameId(fid);
+        queue.add(new FrameData(rgba, cw, ch, fid, System.nanoTime(), lastServerTick,
+                sampleKeys(client)));
+    }
+
+    /** M11：采样帧采集时刻的按键状态（渲染线程调用）。
+
+     * <p>M11.5 修复：相机记**绝对角**而非帧间差分——差分在这里做会被 FrameSender 的
+     * 30fps 流控丢帧连带丢掉（实测 look_at 下压 54° 只剩 0.3° 进数据），改由
+     * FrameSender 在发送时对上一个**实际发出**的帧做差分，丢帧转角自动并入下一帧，
+     * 积分严格闭合（∑Δ = 终态 − 初态）。 */
+    private KeyState sampleKeys(MinecraftClient client) {
+        int buttons = KeyRecorder.sampleButtons(client);
+        int slot = client.player != null ? client.player.getInventory().selectedSlot : -1;
+        return new KeyState(buttons, slot, client.player.getYaw(), client.player.getPitch());
     }
 
     /** 一帧像素数据；仅传引用（ConcurrentLinkedQueue），渲染线程零编码。 */
@@ -146,15 +184,37 @@ public final class FrameGrabber {
         public final int frameId;
         public final long wallNanos;
         public final int lastServerTick;
+        /** M11：帧采集时刻的按键状态（帧↔按键对齐）。 */
+        public final KeyState keys;
 
         public FrameData(byte[] rgba, int width, int height, int frameId,
-                         long wallNanos, int lastServerTick) {
+                         long wallNanos, int lastServerTick, KeyState keys) {
             this.rgba = rgba;
             this.width = width;
             this.height = height;
             this.frameId = frameId;
             this.wallNanos = wallNanos;
             this.lastServerTick = lastServerTick;
+            this.keys = keys;
+        }
+    }
+
+    /** M11：帧采集时刻的按键状态快照。 */
+    public static final class KeyState {
+        /** 11 按键位掩码（bit0=forward … bit10=inventory，见 KeyRecorder）。 */
+        public final int buttons;
+        /** 当前选中的快捷栏槽位 0-8；-1 = 无。 */
+        public final int selectedSlot;
+        /** 帧采集时刻相机 yaw 绝对角（度；差分在 FrameSender 发送时做，见 sampleKeys）。 */
+        public final float yawAbs;
+        /** 帧采集时刻相机 pitch 绝对角（度）。 */
+        public final float pitchAbs;
+
+        public KeyState(int buttons, int selectedSlot, float yawAbs, float pitchAbs) {
+            this.buttons = buttons;
+            this.selectedSlot = selectedSlot;
+            this.yawAbs = yawAbs;
+            this.pitchAbs = pitchAbs;
         }
     }
 }

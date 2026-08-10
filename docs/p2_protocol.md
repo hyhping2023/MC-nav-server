@@ -160,9 +160,36 @@ VLA 辅助 state / reward 计算用，32×32×32（可配置半径）：
 
 服务端输出 **Waypoints**（航点列表）作为观测/指令，供 VLA 参考与 reward 判定：
 
-- **首选：自研 3D A\***（确定性、可控成本表）：8 方向、每格成本由方块类型表决定（空气=1、可跳跃=2、岩浆/水=∞），支持跳跃/潜行标记。输出 `List<BlockPos>` 压缩为拐点序列。
+- **动作级 3D A\***（NavV2）：XZ 8 方向 × 垂直多档，方块分类 PASSABLE/BREAKABLE/UNBREAKABLE
+  （`Material.getHardness()` 分级），动作集 walk/jump/fall/dig/dig_down/place（cost_mode 门控）；
+  破块距离惩罚（远离目标挖穿贵→绕路）；reach-aware 目标微调（采集距离 ~2 格）。
 - 备选：复用原版寻路（NMS `PathFinder` + `WalkNodeEvaluator`），需 NMS 访问；或引入第三方 Bukkit 寻路库。
-- 外部接入：`ComputePath(from, to, cost_mode) → PathReply{waypoints[]}`，Python 可再喂给 VLA 作为语言/航点指令。
+- 外部接入：`ComputePath(from, to, cost_mode) → PathReply{waypoints[], found, details[]}`，
+  `details` = 动作级航点 `{pos, action, target}`（action ∈ walk|jump|fall|dig|dig_down|place），
+  Python 执行器按动作分派执行（移动/挖穿/下挖/垫方块），可再喂给 VLA 作为语言/航点指令。
+
+### 7.1 M11.5 粗航点语义（`CoarsePathPlanner`，两层导航，DESIGN.md §17.3 难点⑤）
+
+全局 A* 退役后 `ComputePath` 的现行语义：
+
+1. **直线可达**（LOS，脚+头双格 0.5 格采样）→ `waypoints=[start, goal]`、`found=true`；
+2. **直线被挡** → 沿 start→goal 连线每 8 格采样一列，垂直方向在插值高度 ±8 内吸附最近
+   可站格（脚+头可通行、脚下实心非危险），该列不可站向邻列（±1、±2 环）借位，仍不可站
+   跳过该点（空档交客户端 LocalPathfinder）→ `waypoints=[start, wp₁…, goal′]`、`found=true`；
+   `goal′` = 目标 3D 邻域（水平 ±3、垂直 -4..+4）最近可站格；
+3. **目标邻域无可站格** → `found=false`（调用方黑名单/游走兜底）。
+
+`details` 恒空；`cost_mode` 保留但等价。客户端在相邻途径点间做半径 24 的局部 A*
+（walk / step_up / fall≤3 / dig-through / dig_step_up），逐 tick 执行。
+
+## 7.2 M11.5 其余 gRPC 契约变更
+
+| 项 | 变更 |
+|---|---|
+| `ResetRequest` | 新增 `has_spawn/spawn_x/spawn_y/spawn_z/spawn_yaw`（字段 9-13）：自定义出生点（难点③）。`has_spawn=true` 时传送至该点；region 未显式给出时以 spawn 为中心做基线快照 |
+| `StepReply.info` | 新增 `mined_total` / `mined_offtarget`（本 episode 全部/非目标挖掘计数，字符串编码） |
+| 过度挖掘惩罚 | `TaskSpec.digPenalty`（内置采集任务默认 0.05）：每挖一块非目标方块 `rewardSinceLastStep -= digPenalty`（server-authoritative，难点③）；挖目标块永不惩罚 |
+| data-driven 任务 | `plugins/VlaPlugin/tasks/*.json`（schema 见 `TaskRegistry` 类注释）onEnable 加载；`vla reloadtasks` 热重载；同 id 覆盖内置（难点②） |
 
 ---
 
