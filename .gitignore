@@ -29,3 +29,6 @@ __pycache__/
 
 # demo 视频等生成产物（磁盘保留不入库）
 /datasets/
+
+# 多 worker 客户端运行目录、PID、任务队列和日志
+/runtime/

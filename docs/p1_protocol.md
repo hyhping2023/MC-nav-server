@@ -14,7 +14,7 @@
 | 端口 | `30001 + env_idx`（每 env 独立 WS 端口） | §13.2 / §6.4 |
 | 实现 | 客户端内嵌 WS Server（Java-WebSocket 1.5.6，shadow 进 mod jar） | §5.1 / P1.1 |
 | 心跳 | `ping/pong` 心跳与断线清理 | P1.1 |
-| 多 env | 每 env 进程 = 1 个客户端 WS 连接 + 1 个玩家身份（共享同一 Purpur 服务器） | §6.4 |
+| 多 env | 每 env 进程 = 1 个客户端 WS 连接 + 1 个玩家身份（共享同一 Purpur 服务器）；每个客户端必须使用独立 `runDir`，避免 autojoin/options/logs 冲突 | §6.4 |
 
 > 端口冲突风险与动态分配：并行 env 各自绑定唯一 WS 端口（`30001+n`），动态分配 + 启动探测（§14.9）。
 

@@ -2,6 +2,7 @@ name: vla-purpur
 version: 0.1.0
 main: dev.vla.purpur.VlaPlugin
 api-version: 1.20
+load: STARTUP
 description: VLA research environment gRPC bridge (M1 comm + M4 world engine + M5 task + M6 state/path)
 author: vla
 commands:

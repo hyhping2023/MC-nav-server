@@ -207,7 +207,8 @@ class ClientWs:
 
         self._send_json(to_ws(action))
 
-    def send_goto_path(self, waypoints: list, dig: Optional[list] = None) -> None:
+    def send_goto_path(self, waypoints: list, dig: Optional[list] = None,
+                       move_only: bool = False) -> None:
         """下行 goto_path：启动客户端本地路径跟随（有序整数方块坐标）。
 
         客户端 NavExecutor 逐 tick 转向/侧移/跳跃 + 碰撞箱 + 到达/卡死检测，
@@ -220,6 +221,8 @@ class ClientWs:
             "cmd": "goto_path",
             "waypoints": [[int(x), int(y), int(z)] for x, y, z in waypoints],
         }
+        if move_only:
+            msg["mode"] = "move_only"
         if dig:
             out = []
             for d in dig:

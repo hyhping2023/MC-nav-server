@@ -75,17 +75,21 @@ class SeedReplayApi:
         self,
         seed: Optional[int] = None,
         task: Optional[str] = None,
+        surface: Optional[str] = None,
         items: Optional[Sequence[str]] = None,
         region: Optional[Dict[str, Any]] = None,
         ticks: Optional[int] = None,
         spawn: Optional[Sequence[float]] = None,
         humanize: bool = False,
+        select_surface: bool = True,
     ) -> Tuple[Frame, Dict[str, Any]]:
         """确定性重置世界 + 收首帧 + obs。
 
         同 seed → 同一区域基线恢复（服务端缓存）+ 同一固定工具包 → 世界态可回放。
         spawn=(x, y, z[, yaw]) 自定义出生点（M11.5 难点③）。humanize=True 时开启
-        客户端执行器人类化整形（seed 同步传入，整形序列可复现）。
+        客户端执行器人类化整形（seed 同步传入，整形序列可复现）。并发持久 worker
+        在启动时已绑定其专属 surface world 时可设 select_surface=False：此时 seed 只
+        作为 episode seed，绝不重新选择/传送地图。
         返回 (frame, obs)；checksum 存 self.last_checksum。
         """
         if task is not None:
@@ -93,6 +97,10 @@ class SeedReplayApi:
         self.seed = seed
         self._episode_count += 1
         self.episode_id = f"ep-{self._episode_count:06d}"
+
+        if surface is not None and select_surface:
+            self.grpc.select_surface_world(
+                player=self.player, surface=surface, seed=int(seed or 0))
 
         resp = self.grpc.reset_world(
             player=self.player, task=self.task, seed=seed, region=region, items=items,

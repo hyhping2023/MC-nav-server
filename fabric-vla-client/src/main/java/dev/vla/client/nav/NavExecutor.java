@@ -21,8 +21,8 @@ import net.minecraft.util.math.MathHelper;
  * <ul>
  *   <li><b>本地挖穿执行</b>：LocalPathfinder 返回 digTargets（计划挖的方块），本地路径
  *       推进前先挖穿——不再把可挖块上报 Python 慢挖。</li>
- *   <li><b>stuck 恢复链</b>：卡死 → 本地重规划（≤3 次）→ 站原地挖面前方块（≤2 次，
- *       mc-collector stuckDig 借鉴）→ 仍卡才上报 STUCK。</li>
+ *   <li><b>stuck 恢复链</b>：卡死 → 本地重规划（≤3 次）→ 上报 STUCK。需要登高时
+ *       由 {@link PillarExecutor} 专门执行脚底垫方块，而不原地乱挖。</li>
  *   <li><b>碰撞检测多点采样</b>：1.0~3.0 米三条射线，台阶（1 格台）不误报墙。</li>
  *   <li><b>LocalResult 返回</b>：localPath 带挖块列表（本地只挖计划内方块，杜绝乱挖掘）。</li>
  * </ul>
@@ -51,10 +51,8 @@ public final class NavExecutor {
     private static final int DIG_ABANDON_TICKS = 120;
     /** 导航视角 pitch 夹紧。 */
     private static final double PITCH_CLAMP = 20.0;
-    /** 本地重规划上限（超过后尝试站原地挖面前方块脱困）。 */
+    /** 本地重规划上限（用尽后上报 STUCK 交由上层决定换目标或垫方块）。 */
     private static final int LOCAL_REPLAN_MAX = 3;
-    /** 站原地挖面前方块脱困的次数上限（mc-collector stuckDig 借鉴；仍卡才上报 STUCK）。 */
-    private static final int STUCK_DIG_MAX = 2;
 
     // M11.6 冲刺滞回（latch）：进入冲刺的最小水平距 / 最大 yaw 误差。
     private static final double SPRINT_ON_DIST = 5.0;
@@ -75,6 +73,8 @@ public final class NavExecutor {
     private List<BlockPos> waypoints;
     private int idx = 0;
     private boolean active = false;
+    /** move_only：站位导航阶段禁止本地挖穿/填坑，绝不输出 attack。 */
+    private boolean moveOnly = false;
 
     // ---- 卡死检测 ----
     private double lastDistToWp = Double.NaN;
@@ -104,8 +104,6 @@ public final class NavExecutor {
     private int localIdx = 0;
     private int localReplanCount = 0;
     private final Set<BlockPos> failedBlockers = new HashSet<>();  // 本地重规划已绕不过的块
-    /** 卡死脱困：站原地挖面前方块的剩余次数。 */
-    private int stuckDigLeft = 0;
     /** M11.6 冲刺 latch：一旦开启持续到「关闭条件」才熄灭（死区内保持），防每 tick 硬阈值抖动。 */
     private boolean sprintLatched = false;
 
@@ -121,8 +119,13 @@ public final class NavExecutor {
     }
 
     public synchronized void setPath(List<BlockPos> path, List<DigPlan> digs) {
+        setPath(path, digs, false);
+    }
+
+    public synchronized void setPath(List<BlockPos> path, List<DigPlan> digs, boolean moveOnly) {
         this.waypoints = path == null ? null : new ArrayList<>(path);
         this.digTargets = digs == null ? null : new ArrayList<>(digs);
+        this.moveOnly = moveOnly;
         this.idx = 0;
         this.active = this.waypoints != null && !this.waypoints.isEmpty();
         this.lastDistToWp = Double.NaN;
@@ -137,7 +140,6 @@ public final class NavExecutor {
         this.localPlaceTargets = null;
         this.placeTarget = null;
         this.placeTicks = 0;
-        this.stuckDigLeft = STUCK_DIG_MAX;   // 每次新路径重置卡死脱困次数
         this.failedBlockers.clear();
         this.avoidCells.clear();
         this.sprintLatched = false;
@@ -160,10 +162,10 @@ public final class NavExecutor {
         this.localPlaceTargets = null;
         this.placeTarget = null;
         this.placeTicks = 0;
-        this.stuckDigLeft = 0;
         this.failedBlockers.clear();
         this.avoidCells.clear();
         this.sprintLatched = false;
+        this.moveOnly = false;
     }
 
     public synchronized boolean isActive() {
@@ -228,11 +230,11 @@ public final class NavExecutor {
         // 0) 挖穿子模式：服务端 dig 计划 / 本地 dig 列表 / 卡死脱困挖掘共用。
         //    M11.5 触达门控：目标超出 SUBMODE_REACH 时先沿路走近（挂起子模式），
         //    防止对远处方块空挥到 DIG_ABANDON_TICKS。
-        if (digTarget != null && distToWpCenter(player, digTarget.pos()) > SUBMODE_REACH) {
+        if (!moveOnly && digTarget != null && distToWpCenter(player, digTarget.pos()) > SUBMODE_REACH) {
             digTarget = null;
             digTicks = 0;
         }
-        if (digTarget != null) {
+        if (!moveOnly && digTarget != null) {
             BlockPos digPos = digTarget.pos();
             if (player.getWorld().getBlockState(digPos).isAir()) {
                 if (digTargets != null) digTargets.remove(digTarget);
@@ -283,7 +285,8 @@ public final class NavExecutor {
         if (!followingLocal && localPath == null
                 && distToWpCenter(player, swp) > ARRIVE_DIST + 2.0) {
             BlockPos feet = new BlockPos(player.getBlockX(), player.getBlockY(), player.getBlockZ());
-            LocalPathfinder.LocalResult result = LocalPathfinder.findPath(feet, swp, avoidCells);
+            LocalPathfinder.LocalResult result = LocalPathfinder.findPath(
+                    feet, swp, avoidCells, !moveOnly);
             if (result != null && result.points.size() > 1) {
                 localPath = result.points;
                 localIdx = 1;
@@ -296,7 +299,7 @@ public final class NavExecutor {
         }
 
         // 1.5) 本地路径推进前先挖穿计划方块（LocalPathfinder digTargets）
-        if (followingLocal && localDigTargets != null && !localDigTargets.isEmpty()) {
+        if (!moveOnly && followingLocal && localDigTargets != null && !localDigTargets.isEmpty()) {
             BlockPos toDig = null;
             for (BlockPos d : localDigTargets) {
                 if (!player.getWorld().getBlockState(d).isAir()) {
@@ -318,7 +321,7 @@ public final class NavExecutor {
         // 1.6) place 子模式（M11.5 难点③）：本地路径推进前先放置补落脚点。
         //      站定（不前进）→ 选泥土 → 瞄支撑（1 格深坑瞄下方块中心=命中其顶面；
         //      1 格宽沟瞄对侧支撑朝沟侧面偏下点）→ settle 后 use 脉冲 → 校验落脚格实心。
-        if (placeTarget != null) {
+        if (!moveOnly && placeTarget != null) {
             if (BlockTraits.isGround(player.getWorld().getBlockState(placeTarget))) {
                 if (localPlaceTargets != null) localPlaceTargets.remove(placeTarget);
                 placeTarget = null;
@@ -339,7 +342,7 @@ public final class NavExecutor {
                 return placeCmd;
             }
         }
-        if (followingLocal && localPlaceTargets != null && !localPlaceTargets.isEmpty()) {
+        if (!moveOnly && followingLocal && localPlaceTargets != null && !localPlaceTargets.isEmpty()) {
             BlockPos toPlace = null;
             for (BlockPos c : localPlaceTargets) {
                 if (!BlockTraits.isGround(player.getWorld().getBlockState(c))) {
@@ -371,7 +374,7 @@ public final class NavExecutor {
         if (!followingLocal) {
             BlockPos blocker = collisionToWaypoint(player, swp);
             if (blocker != null && !failedBlockers.contains(blocker)) {
-                if (digTargets != null) {
+                if (!moveOnly && digTargets != null) {
                     for (DigPlan dp : digTargets) {
                         if (dp.pos().equals(blocker)) {
                             digTarget = dp;   // 带工具标注的计划块
@@ -394,7 +397,8 @@ public final class NavExecutor {
                 if (localReplanCount < LOCAL_REPLAN_MAX) {
                     // 局部 A* 绕障碍（异步计算，本 tick 照常走路）
                     BlockPos feet = new BlockPos(player.getBlockX(), player.getBlockY(), player.getBlockZ());
-                    LocalPathfinder.LocalResult result = LocalPathfinder.findPath(feet, swp, avoidCells);
+                    LocalPathfinder.LocalResult result = LocalPathfinder.findPath(
+                            feet, swp, avoidCells, !moveOnly);
                     localReplanCount++;
                     failedBlockers.add(blocker);
                     avoidCells.add(blocker);   // M11.5「换路」：下次重规划绕开失败走廊
@@ -432,13 +436,16 @@ public final class NavExecutor {
             xzStillTicks = 0;
         }
 
-        // XZ 不动或 3D 无进展 → 本地恢复链：重规划 → 站原地挖面前方块 → 上报 STUCK
+        // XZ 不动或 3D 无进展 → 本地恢复链：重规划后直接上报 STUCK。
+        // 导航不再用跳跃/乱挖突破高度；受控任务由上层发 pillar_up，再由
+        // PillarExecutor 在脚底正下方垫方块登高。
         if ((xzStillTicks >= STUCK_XZ_TICKS || noProgressTicks >= STUCK_TICKS)
                 && dist > STUCK_MIN_PROGRESS) {
             if (localReplanCount < LOCAL_REPLAN_MAX) {
                 BlockPos feet = new BlockPos(player.getBlockX(), player.getBlockY(), player.getBlockZ());
                 avoidCells.add(feet);   // M11.5「换路」：卡死脚位加入避让集
-                LocalPathfinder.LocalResult result = LocalPathfinder.findPath(feet, swp, avoidCells);
+                LocalPathfinder.LocalResult result = LocalPathfinder.findPath(
+                        feet, swp, avoidCells, !moveOnly);
                 localReplanCount++;
                 xzStillTicks = 0;
                 noProgressTicks = 0;
@@ -449,23 +456,8 @@ public final class NavExecutor {
                     localPlaceTargets = result.placeTargets;
                     if (pathDebugListener != null) pathDebugListener.accept(localPath);
                 }
-            } else if (stuckDigLeft > 0 && digTarget == null) {
-                // 重规划用尽：站原地挖面前方块脱困（mc-collector stuckDig 借鉴）。
-                // 挖穿后 tick 自然解锁新路径；仍卡再挖下一次，用尽才上报 STUCK。
-                BlockPos front = solidAhead(player);
-                if (front != null && isBreakable(player.getWorld().getBlockState(front))) {
-                    stuckDigLeft--;
-                    digTarget = new DigPlan(front, null, null);
-                    digTicks = 0;
-                    selectDigTool(player, digTarget);   // M11.6：卡死脱困挖掘同样首 tick 切工具
-                    aimAtBlock(player, front);
-                    ActionCmd dig = new ActionCmd();
-                    dig.attack = true;
-                    return dig;
-                }
-                stuckDigLeft = 0;
             }
-            if (stuckDigLeft <= 0 && localReplanCount >= LOCAL_REPLAN_MAX) {
+            if (localReplanCount >= LOCAL_REPLAN_MAX) {
                 fire(Status.STUCK,
                         new BlockPos(player.getBlockX(), player.getBlockY(), player.getBlockZ()),
                         swp, "local replan exhausted (" + LOCAL_REPLAN_MAX + ")");
@@ -480,7 +472,8 @@ public final class NavExecutor {
         else if (targetPitch < -PITCH_CLAMP) targetPitch = -PITCH_CLAMP;
         VlaClient.getInstance().setCameraTarget(targetYaw, targetPitch);
 
-        // 5) 移动动作 + 主动跳跃检测
+        // 5) 移动动作。受控平原任务禁止导航跳跃/跳挖；高目标统一交由
+        // PillarExecutor 垫方块到合适高度后再采集。
         ActionCmd cmd = new ActionCmd();
         cmd.forward = true;
         double curYaw = player.getYaw();
@@ -500,41 +493,8 @@ public final class NavExecutor {
             sprintLatched = true;
         }
         cmd.sprint = sprintLatched;
-        // 主动跳跃：前方有 1 格台阶 or 航点高于玩家
-        cmd.jump = shouldJumpNow(player) || (h < 1.5 && wy > py + 0.5);
+        cmd.jump = false;
         return cmd;
-    }
-
-    /**
-     * 主动跳跃检测（M10）：玩家面向方向 1~2 格前方脚格有 1 格实心台阶且上方 2 格可站 → 跳。
-     * 不等卡住才跳——服务端已规划 step_up 动作，客户端在服务端航点间自主判断。
-     */
-    private static boolean shouldJumpNow(ClientPlayerEntity player) {
-        double yawRad = Math.toRadians(player.getYaw());
-        double fx = -Math.sin(yawRad);
-        double fz = Math.cos(yawRad);
-        double px = player.getX();
-        double py = player.getY();
-        double pz = player.getZ();
-        for (int k = 1; k <= 2; k++) {
-            int ax = (int) Math.floor(px + fx * k);
-            int az = (int) Math.floor(pz + fz * k);
-            int ay = (int) Math.floor(py);
-            // 脚格 (+0) 是实心台 → 头格 (+1) 和头顶 (+2) 都可站 → 1 格台阶
-            BlockPos foot = new BlockPos(ax, ay, az);
-            BlockPos head = new BlockPos(ax, ay + 1, az);
-            BlockPos above = new BlockPos(ax, ay + 2, az);
-            if (isSolid(player.getWorld().getBlockState(foot))
-                    && isPassable(player.getWorld().getBlockState(head))
-                    && isPassable(player.getWorld().getBlockState(above))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean isPassable(BlockState state) {
-        return state == null || state.isAir() || !state.isSolid();
     }
 
     /** 碰撞检测：朝目标航点方向 1.0/2.0/3.0 米三条射线，返回最近实心块（台阶不误报）。 */
@@ -558,7 +518,8 @@ public final class NavExecutor {
 
     /**
      * 玩家前方 {@code ahead} 米处脚格/头格采样：双脚实心返回脚格，仅头实心返回头格。
-     * 脚下有 1 格台（前方脚格实心但脚下即地面）不算墙——上台阶由 shouldJumpNow 处理。
+     * 脚下有 1 格台（前方脚格实心但脚下即地面）不算墙；受控平原中这类台阶交由上层
+     * 重新规划或 pillar_up 处理，不以导航跳跃跨越。
      */
     private BlockPos sampleColumn(ClientPlayerEntity player, double fx, double fz, double ahead) {
         double px = player.getX();
@@ -573,26 +534,6 @@ public final class NavExecutor {
         boolean headSolid = isSolid(player.getWorld().getBlockState(headPos));
         if (feetSolid && headSolid) return feetPos;
         if (!feetSolid && headSolid) return headPos;
-        return null;
-    }
-
-    /** 玩家面向正前方 1~2 米内首个实心块（脚格优先，头格次之）；无则 null。卡死脱困用。 */
-    private BlockPos solidAhead(ClientPlayerEntity player) {
-        double yawRad = Math.toRadians(player.getYaw());
-        double fx = -Math.sin(yawRad);
-        double fz = Math.cos(yawRad);
-        double px = player.getX();
-        double py = player.getY();
-        double pz = player.getZ();
-        for (int k = 1; k <= 2; k++) {
-            int bx = (int) Math.floor(px + fx * k);
-            int by = (int) Math.floor(py);
-            int bz = (int) Math.floor(pz + fz * k);
-            BlockPos feet = new BlockPos(bx, by, bz);
-            BlockPos head = new BlockPos(bx, by + 1, bz);
-            if (isSolid(player.getWorld().getBlockState(feet))) return feet;
-            if (isSolid(player.getWorld().getBlockState(head))) return head;
-        }
         return null;
     }
 
@@ -709,7 +650,6 @@ public final class NavExecutor {
         this.localPlaceTargets = null;
         this.placeTarget = null;
         this.placeTicks = 0;
-        this.stuckDigLeft = 0;
         if (statusListener != null) {
             statusListener.accept(new StatusEvent(status, pos, wp, detail));
         }

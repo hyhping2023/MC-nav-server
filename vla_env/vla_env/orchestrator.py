@@ -24,7 +24,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from .tasks import TaskProfile, kit_slot_for_tool, tool_for_block
 
 # 采集可达距离（生存 reach 4.5，留余量；从脚位算）
+# 站立采集距离。超过该范围先用 pillar_up 垫脚底方块，绝不跳挖。
 REACH = 3.2
+# 到目标相邻落脚点的到达半径。采集任务必须先完成此阶段，不能仅因目标落在
+# REACH 内就原地开挖。
+APPROACH_ARRIVE_DIST = 1.05
+BLOCK_REACH = 4.25
+MAX_BATCH_TARGETS = 16
 # 近战攻击距离
 MELEE_REACH = 2.4
 # place 任务目标距离窗（M11.6：选较远的目标格，不再"走到哪放到哪"）
@@ -65,6 +71,7 @@ class KitAgent:
         events_source: Optional[Callable[[], List[Dict[str, Any]]]] = None,
         on_no_target: Optional[Callable[[], bool]] = None,
         log: Callable[[str], None] = lambda s: print(s, flush=True),
+        protected_ground_y: Optional[int] = None,
     ) -> None:
         self.api = api
         self.profile = profile
@@ -72,6 +79,9 @@ class KitAgent:
         self.half_extent = half_extent
         self.recorder = recorder
         self.log = log
+        # M11.7 受控扁平环境：y<=此值的方块受插件保护（不可破坏，只有柱/树可挖）。
+        # _select_target 跳过这些格，避免反复挖地面浪费步数。
+        self.protected_ground_y = protected_ground_y
         # 目标补给回调（kill 任务）：目标实体从世界消失（惊逃坠亡/despawn，击杀
         # 计数不涨 → episode 不可完成）时由 demo 层补 spawn；返回 True=已补。
         self.on_no_target = on_no_target
@@ -93,6 +103,10 @@ class KitAgent:
         self._blacklist_resets = 0
         # 已做过横向绕行重试的目标（每目标一次「换路」机会，§17.8）
         self._detoured: Set[Tuple[int, int, int]] = set()
+        # 目标初始构造完成后仅做一次镜头引导：目标保证进入画面，但偏离准星中心，后续
+        # 正常导航/瞄准仍由执行策略负责。
+        self._introduced_targets: Set[Tuple[int, int, int]] = set()
+        self._last_arrived_stand: Optional[Tuple[int, int, int]] = None
 
     # ---- 顶层 ----
 
@@ -119,8 +133,8 @@ class KitAgent:
     # ---- dig（collect_stone / dig_dirt / collect_wood） ----
 
     def _run_dig(self, max_steps: int) -> None:
-        target = self._select_target()
-        if target is None:
+        remaining = self._remaining_targets()
+        if not remaining:
             # 视野内无目标：换黑名单轮次 → 垫高重扫 → 游走
             self._highlight(None)
             if self._blacklist and self._blacklist_resets < self.MAX_BLACKLIST_RESET:
@@ -133,37 +147,77 @@ class KitAgent:
                 self._wander()
             return
 
-        # M11.6 debug：高亮当前目标方块（服务端红色粒子，录制可见），方便定位
-        # "在几个方块来回跳"的目标选择行为。
-        self._highlight(target)
+        # 阶段 1：在当前高度寻找“最近落脚点 + 可批量挖的目标集合”。
+        plan = self._choose_ground_batch(remaining)
+        if plan is not None:
+            stand, batch = plan
+            focus = batch[0]
+            self._highlight(focus)
+            self._introduce_target(focus)
+            if self._dist3(self._pos(), self._center(stand)) > APPROACH_ARRIVE_DIST:
+                self._semantic("plan_stand", stand=list(stand),
+                               covers=[list(b) for b in batch])
+                self._semantic("approach_target", target=list(focus), stand=list(stand))
+                status = self._goto(stand, [], stop_near=stand,
+                                    arrive_dist=APPROACH_ARRIVE_DIST, move_only=True)
+                if status in ("arrived", "reach"):
+                    self._last_arrived_stand = stand
+                    self._semantic("arrived_stand", stand=list(stand))
+                    return
+                self._on_stuck(focus, status)
+                return
 
-        pos = self._pos()
-        if self._dist3(pos, self._center(target)) > REACH:
-            goal = self._standable_near(target)
-            digs = self._dig_plan(target)
-            status = self._goto(goal if goal is not None else target, digs,
-                                stop_near=target)
+            # 阶段 2：已站在合法落脚点；连续挖完此站位所有可达目标，而不是每块重走。
+            actual_stand = self._current_stand() or stand
+            self._last_arrived_stand = actual_stand
+            self._semantic("dig_batch_begin", stand=list(actual_stand),
+                           targets=[list(b) for b in batch])
+            mined = 0
+            for target in batch:
+                if self._name_at(target) in (None, "minecraft:air"):
+                    continue
+                if not self._dig_at(target, actual_stand):
+                    self.log(f"  [dig] 站位 {actual_stand} 无法挖 {target} → 黑名单")
+                    self._blacklist.add(target)
+                    break
+                mined += 1
+                if self.progress >= 1.0:
+                    break
+            self._semantic("dig_batch_end", stand=list(actual_stand), mined=mined)
+            return
+
+        # 阶段 3：地面无任何站位可到达剩余目标，才允许垫高。
+        target = self._choose_pillar_target(remaining)
+        if target is None:
+            return
+        base = self._pillar_base_for_target(target)
+        if base is None:
+            self.log(f"  [dig] 找不到高处目标 {target} 的垫高底座 → 黑名单")
+            self._blacklist.add(target)
+            return
+        self._highlight(target)
+        self._introduce_target(target)
+        if self._dist3(self._pos(), self._center(base)) > APPROACH_ARRIVE_DIST:
+            self._semantic("pillar_approach", target=list(target), stand=list(base))
+            status = self._goto(base, [], stop_near=base,
+                                arrive_dist=APPROACH_ARRIVE_DIST, move_only=True)
             if status in ("stuck", "blocked_wall", "blocked_breakable"):
                 self._on_stuck(target, status)
-                return
-            # arrived / timeout / reach —— 落到下方统一的可达性检查
+            return
 
-        pos = self._pos()
-        if self._dist3(pos, self._center(target)) <= REACH:
-            if not self._dig_at(target):
-                self.log(f"  [dig] 挖不掉 {target} → 黑名单")
-                self._blacklist.add(target)
-        else:
-            self.log(f"  [dig] 走位后仍不可达 {target} → 黑名单")
+        target_y = max(int(self._pos()[1]) + 1, int(target[1]) - 1)
+        self.log(f"  [dig] 地面站位均不可达，目标 {target} → pillar_up")
+        self._semantic("pillar_plan", target=list(target), base=list(base),
+                       target_feet_y=target_y)
+        if not self._pillar(target_y=target_y, max_blocks=4):
             self._blacklist.add(target)
 
     def _on_stuck(self, target: Tuple[int, int, int], status: str) -> None:
         """脱困决策树（§17.3 难点③ + §17.8）：横向绕行「换路」一次 → 目标显著
         高于玩家 → 垫方块 → 黑名单换目标。
 
-        （客户端在上报 STUCK 前已用尽三级自愈：避让集重规划 ≤3（绕开失败走廊）+
-        place_step 补落脚点 + 原地挖面前 ≤2；「阶梯式挖通道」也已编码为
-        LocalPathfinder 的 dig_step_up 边。）
+        （客户端在上报 STUCK 前已完成局部避让重规划和必要的落脚补方块。受控平原
+        不允许导航跳跃、跳挖或阶梯挖通道；需要抬高时只使用 PillarExecutor。）
         """
         pos = self._pos()
         dy = target[1] - pos[1]
@@ -187,9 +241,10 @@ class KitAgent:
             self.log(f"  [stuck] {status} → 横向绕行重试 via={mid}")
             self._semantic("stuck_decision", status=status, choice="lateral_detour",
                            via=mid)
-            goal = self._standable_near(target)
-            self._goto(goal if goal is not None else target,
-                       self._dig_plan(target), stop_near=target, via=mid)
+            goal = self._approach_point(target)
+            self._goto(goal if goal is not None else target, [],
+                       stop_near=goal if goal is not None else target,
+                       arrive_dist=APPROACH_ARRIVE_DIST, via=mid, move_only=True)
             return   # 主循环重新评估（可达则挖，仍卡走 ②③）
         dy = target[1] - pos[1]
         if dy >= 2.0:
@@ -329,6 +384,7 @@ class KitAgent:
         stop_near: Optional[Sequence[float]] = None,
         arrive_dist: float = REACH,
         via: Optional[Sequence[int]] = None,
+        move_only: bool = False,
     ) -> str:
         """服务端粗航点 + 客户端 goto_path；泵空动作等终态。
 
@@ -354,9 +410,12 @@ class KitAgent:
             if not found:
                 waypoints = [feet, goal]   # 客户端 LocalPathfinder 局部兜底
         self.api.ws.send_goto_path(
-            [[int(w[0]), int(w[1]), int(w[2])] for w in waypoints], dig=digs or None)
+            [[int(w[0]), int(w[1]), int(w[2])] for w in waypoints],
+            dig=None if move_only else (digs or None),
+            move_only=move_only)
         self._semantic("goto_path", goal=list(goal), waypoints=len(waypoints),
-                       digs=len(digs or []), server_found=bool(found))
+                       digs=0 if move_only else len(digs or []), server_found=bool(found),
+                       mode="move_only" if move_only else "default")
 
         for _ in range(budget):
             self._pump(1)
@@ -393,7 +452,8 @@ class KitAgent:
         self.api.ws.send_pillar_cancel()
         return False
 
-    def _dig_at(self, target: Tuple[int, int, int]) -> bool:
+    def _dig_at(self, target: Tuple[int, int, int],
+                stand: Tuple[int, int, int]) -> bool:
         """近身补挖：选工具 + look_at 块中心 + attack 电平，至块变空气。
 
         目标块本身由本层挖（语义标签 dig_target 与 nav 的 dig_obstacle 区分开）；
@@ -406,14 +466,25 @@ class KitAgent:
             slot = self.profile.tool_slot
         self.api.ws.send_goto_cancel()
         self._pump(1)   # 释放导航按键
+        if self._dist3(self._pos(), self._center(stand)) > APPROACH_ARRIVE_DIST:
+            self._semantic("dig_gate_reject", target=list(target), reason="not_at_stand",
+                           stand=list(stand))
+            return False
         self._select_slot(slot)
         cx, cy, cz = self._center(target)
         self.api.ws.send({"cmd": "look_at", "x": cx, "y": cy, "z": cz})
-        self._semantic("dig_at", target=list(target), block=block_name, slot=slot)
+        self._semantic("dig_aim", target=list(target), block=block_name, slot=slot,
+                       stand=list(stand))
         self._pump(2)   # 瞄准收敛（12°/tick × 2 step = 48°，常规角度足够）
+        if not self._aimed_block_is(target):
+            self._semantic("dig_gate_reject", target=list(target), reason="crosshair_or_range")
+            return False
+        self._semantic("dig_at", target=list(target), block=block_name, slot=slot,
+                       stand=list(stand))
         for i in range(self.DIG_BUDGET):
             a = self._idle()
             a["attack"] = True
+            a["jump"] = False
             self._step(a, 1)
             if self.progress >= 1.0:
                 break
@@ -448,7 +519,7 @@ class KitAgent:
             self.api.grpc.show_path(player=self.api.player, waypoints=[],
                                     goal=target, lifetime_ticks=600)
 
-    def _select_target(self) -> Optional[Tuple[int, int, int]]:
+    def _remaining_targets(self) -> List[Tuple[int, int, int]]:
         """体素扫描目标块：排除黑名单/脚下正下方，**优先选 nav 可直接到达的目标**。
 
         M11.6 振荡修复：客户端 LocalPathfinder 只能 fall≤3 / step_up≤1——若选中 3-5 格
@@ -468,7 +539,7 @@ class KitAgent:
                 if pal_name.split("[")[0] == b:
                     wanted.add(i)
         if not wanted:
-            return None
+            return []
         ox, oy, oz = origin
         out: List[Tuple[int, int, int]] = []
         for iy in range(size):
@@ -479,19 +550,14 @@ class KitAgent:
                     b = (ox + ix, oy + iy, oz + iz)
                     if b in self._blacklist:
                         continue
+                    if self.protected_ground_y is not None and b[1] <= self.protected_ground_y:
+                        continue   # M11.7 受保护地面（不可破坏），只挖柱/树
                     if b[0] == int(px) and b[2] == int(pz) and b[1] == int(py) - 1:
                         continue   # 脚下正下方（挖了会掉）
                     if abs(b[1] - py) > 6:
                         continue   # 高差过大（树冠/深层）
                     out.append(b)
-        if not out:
-            return None
-        reachable = [b for b in out if abs(b[1] - py) <= 2]
-        pool = reachable if reachable else out
-        pool.sort(key=lambda b: (b[0] - px) ** 2 + (b[2] - pz) ** 2 + 4 * abs(b[1] - py))
-        top = pool[:3]
-        weights = [3, 2, 1][: len(top)]
-        return self.rng.choices(top, weights=weights, k=1)[0]
+        return out
 
     def _select_place_spot(self) -> Optional[Tuple[int, int, int]]:
         """place 目标格选择（M11.6）：体素扫描找"较远"的可放置地面格。
@@ -533,28 +599,156 @@ class KitAgent:
                         best_score, best = score, (x, by, z)
         return best
 
-    def _dig_plan(self, target: Tuple[int, int, int]) -> List[Dict[str, Any]]:
-        """挖块计划 = 只有目标块本身（带工具标注）。
+    def _choose_ground_batch(
+        self, remaining: List[Tuple[int, int, int]]
+    ) -> Optional[Tuple[Tuple[int, int, int], List[Tuple[int, int, int]]]]:
+        """选择最近合法站位，并覆盖该站位所有站立可挖目标。
 
-        路径阻挡块由客户端 LocalPathfinder 按需规划（dig-through/dig_step_up），
-        不预挖 6 邻域——过度挖掘会吃服务端 dig_penalty（§17.3 难点③）。
+        普通地表站位来自每个目标周围的空地；若 bot 已站在自己垫出的完整泥土柱顶，
+        当前脚格也必须作为候选，以便连续挖完这一高度的目标，而不是又走回地面。
         """
-        name = self._name_at(target) or ""
-        tool = tool_for_block(name)
-        plan = {"x": target[0], "y": target[1], "z": target[2], "block": name}
-        if tool:
-            plan["tool"] = tool
-        return [plan]
+        candidates: Dict[Tuple[int, int, int], List[Tuple[int, int, int]]] = {}
+        for target in remaining:
+            if self._needs_pillar_for_target(target):
+                continue
+            for stand in self._ground_stands_for_target(target):
+                if self._dist3(self._center(stand), self._center(target)) > BLOCK_REACH:
+                    continue
+                candidates.setdefault(stand, []).append(target)
+            current = self._current_stand()
+            if (current is not None
+                    and self._dist3(self._center(current), self._center(target)) <= BLOCK_REACH):
+                candidates.setdefault(current, []).append(target)
+        if not candidates:
+            return None
+        pos = self._pos()
+        best_stand, best_batch = min(
+            candidates.items(),
+            key=lambda pair: (
+                self._dist3(pos, self._center(pair[0])),
+                -len(pair[1]),
+                pair[0],
+            ))
+        # 同一站位按低→高、近→远挖，避免高处先触发不必要的 pillar。
+        best_batch = sorted(set(best_batch), key=lambda b: (
+            b[1], self._dist3(self._center(best_stand), self._center(b)), b))
+        return best_stand, best_batch[:MAX_BATCH_TARGETS]
 
-    def _standable_near(self, target: Tuple[int, int, int]) -> Optional[Tuple[int, int, int]]:
-        """目标（实心块）相邻的可站脚位：水平 4 邻实心块上方，或目标顶上。"""
-        x, y, z = target
-        for nx, nz in ((x + 1, z), (x - 1, z), (x, z + 1), (x, z - 1)):
-            if self._solid(nx, y, nz) and not self._solid(nx, y + 1, nz):
-                return (nx, y + 1, nz)
-        if not self._solid(x, y + 1, z):
-            return (x, y + 1, z)
-        return None
+    def _current_stand(self) -> Optional[Tuple[int, int, int]]:
+        """当前可站脚格；用于垫高后在柱顶连续批量挖高处目标。"""
+        st = self._state()
+        if not st["player"].get("on_ground", False):
+            return None
+        px, py, pz = (float(v) for v in st["player"]["pos"])
+        feet = (int(math.floor(px)), int(math.floor(py)), int(math.floor(pz)))
+        # 玩家脚格和头格应为空，脚下须有完整支撑（地表或先前垫的泥土）。
+        if (self._solid(feet[0], feet[1], feet[2])
+                or self._solid(feet[0], feet[1] + 1, feet[2])
+                or not self._solid(feet[0], feet[1] - 1, feet[2])):
+            return None
+        return feet
+
+    def _choose_pillar_target(
+        self, remaining: List[Tuple[int, int, int]]
+    ) -> Optional[Tuple[int, int, int]]:
+        high = [b for b in remaining if self._needs_pillar_for_target(b)]
+        if not high:
+            return None
+        pos = self._pos()
+        return min(high, key=lambda b: (
+            b[1], self._dist3(pos, self._center(b)), b))
+
+    def _ground_stands_for_target(
+        self, target: Tuple[int, int, int]
+    ) -> List[Tuple[int, int, int]]:
+        x, _y, z = target
+        py = int(self._pos()[1])
+        out = []
+        for radius in range(1, 3):
+            for dx in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dz)) != radius:
+                        continue
+                    nx, nz = x + dx, z + dz
+                    ground = (self.protected_ground_y if self.protected_ground_y is not None
+                              else self._ground_y(nx, py, nz))
+                    if ground is None or not self._solid(nx, ground, nz):
+                        continue
+                    feet = (nx, ground + 1, nz)
+                    if self._solid(nx, feet[1], nz) or self._solid(nx, feet[1] + 1, nz):
+                        continue
+                    out.append(feet)
+        return out
+
+    def _introduce_target(self, target: Tuple[int, int, int]) -> None:
+        """录制开场将镜头转向目标附近，而非目标中心。
+
+        目标位置由服务器控制在 6~12 格附近；此处瞄向目标中心旁的随机偏移点，使目标处于
+        第一视角画面中但不在十字准星正中心。之后 bot 会自行导航并精确瞄准挖掘。
+        """
+        if target in self._introduced_targets:
+            return
+        self._introduced_targets.add(target)
+        cx, cy, cz = self._center(target)
+        dx, dz = cx - self._pos()[0], cz - self._pos()[2]
+        h = math.hypot(dx, dz) or 1.0
+        side = self.rng.choice((-1.0, 1.0))
+        # 偏移量控制在目标仍留在典型 FOV 内的范围，并略向下偏以保留地平线/环境线索。
+        look_x = cx - dz / h * side * 1.3
+        look_y = cy - 0.35
+        look_z = cz + dx / h * side * 1.3
+        self.api.ws.send({"cmd": "look_at", "x": look_x, "y": look_y, "z": look_z})
+        self._semantic("target_in_frame", target=list(target),
+                       look_at=[round(look_x, 2), round(look_y, 2), round(look_z, 2)])
+        self._pump(3)
+
+    def _needs_pillar_for_target(self, target: Tuple[int, int, int]) -> bool:
+        """目标高到正常站立不可触及时，使用脚底垫方块登高而非跳挖。
+
+        Minecraft 角色站在脚格 y 时眼高约 y+1.62；柱顶方块中心距离超过约 3m 已不应
+        直接攻击。这里使用目标底面相对脚格的 2 格阈值：柱第 3/4 格会先触发
+        PillarExecutor，成功后再按正常站立姿势挖掘。
+        """
+        py = float(self._pos()[1])
+        return target[1] - py >= 2.0
+
+    def _approach_point(self, target: Tuple[int, int, int]) -> Optional[Tuple[int, int, int]]:
+        """目标相邻的平地脚位。
+
+        不能把相邻的任务块（例如石头矮墙的下一块）误当作地面；否则会规划到
+        `(target_x, target_y+1, target_z)` 的“目标顶上”，既走不到，也让外观看起来像
+        没靠近就开始操作。对于单材质受保护世界，候选必须站在原始地表
+        `protected_ground_y + 1`，且脚/头两格均为空。
+
+        候选按离目标由近到远的环搜索（1~3 格），因此一整段矮墙、平台或阶梯旁仍能找到
+        真正的空地落脚点；返回值永远是玩家脚格，不会是目标顶上。
+        """
+        stands = self._ground_stands_for_target(target)
+        if not stands:
+            return None
+        return min(stands, key=lambda stand: (
+            self._dist3(self._center(stand), self._center(target)),
+            self._dist3(self._pos(), self._center(stand)),
+            stand))
+
+    def _pillar_base_for_target(
+        self, target: Tuple[int, int, int]
+    ) -> Optional[Tuple[int, int, int]]:
+        return self._approach_point(target)
+
+    def _aimed_block_is(self, target: Tuple[int, int, int]) -> bool:
+        """客户端准星/交互距离门控，失败时绝不发 attack。"""
+        self.api.ws.send_state()
+        for _ in range(4):
+            self._pump(1)
+            for event in self._events():
+                if event.get("type") != "state":
+                    continue
+                aimed = (event.get("aimed_block_x"), event.get("aimed_block_y"),
+                         event.get("aimed_block_z"))
+                dist = float(event.get("aimed_block_distance", 99.0))
+                return aimed == tuple(target) and dist <= BLOCK_REACH
+        return False
 
     def _find_entity(self, entity_type: Optional[str]) -> Optional[Tuple[float, float, float]]:
         st = self._state()

@@ -14,8 +14,34 @@ repositories {
     mavenCentral()
 }
 
+/**
+ * 并发录制启动覆盖项（均为可选 Gradle project property）：
+ *
+ *   ./gradlew runClient -PvlaRunDir=../runtime/worker-00/client-run \
+ *       -PvlaWsPort=30001 -PvlaClientXmx=1G
+ *
+ * 每个客户端必须有独立 runDir（autojoin/options/logs 均写在该目录）和独立 WS 端口。
+ * 不设时保持 loom 默认 run/、客户端默认 WS 30001 与 Gradle 默认内存行为。
+ */
+val vlaRunDir = providers.gradleProperty("vlaRunDir")
+val vlaWsPort = providers.gradleProperty("vlaWsPort")
+val vlaClientXmx = providers.gradleProperty("vlaClientXmx")
+
 loom {
     // M0: 仅骨架，无 mixin 目标类；M1 起添加 accessWidener 与 mixin 配置
+    runs {
+        named("client") {
+            if (vlaRunDir.isPresent) {
+                runDir(vlaRunDir.get())
+            }
+            if (vlaWsPort.isPresent) {
+                vmArg("-Dvla.ws.port=${vlaWsPort.get()}")
+            }
+            if (vlaClientXmx.isPresent) {
+                vmArg("-Xmx${vlaClientXmx.get()}")
+            }
+        }
+    }
 }
 
 dependencies {

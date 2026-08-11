@@ -1,12 +1,15 @@
 package dev.vla.purpur.task;
 
+import dev.vla.purpur.world.ObjectPlacer;
 import io.grpc.stub.StreamObserver;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import org.bukkit.Bukkit;
+import org.bukkit.Material;
 import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.Plugin;
 import vla.Vla.StepReply;
 
@@ -74,6 +77,14 @@ public final class TaskManager {
      * @return 成功设置的任务 spec；未知任务返回 null
      */
     public TaskSpec setTask(Player player, String taskId) {
+        return setTask(player, taskId, 0L);
+    }
+
+    /**
+     * 设置任务并为受控采集任务生成唯一目标。任务目标的随机位置由 {@code seed} 决定；
+     * ResetWorld 会先恢复平原基线，随后 SetTask 才放置目标，保证每个 episode 只有一个。
+     */
+    public TaskSpec setTask(Player player, String taskId, long seed) {
         TaskSpec spec = TaskRegistry.get(taskId);
         if (spec == null) {
             return null;
@@ -82,7 +93,9 @@ public final class TaskManager {
         state.task = spec;
         state.steps = 0;
         states.put(player.getUniqueId(), state);
-        plugin.getLogger().info("[task] " + player.getName() + " set task: " + taskId);
+        boolean placed = ObjectPlacer.placeForTask(plugin, player, taskId, seed);
+        plugin.getLogger().info("[task] " + player.getName() + " set task: " + taskId
+                + " seed=" + seed + " singleTarget=" + placed);
         return spec;
     }
 
@@ -102,7 +115,7 @@ public final class TaskManager {
         st.minedTotal++;
         boolean isTarget = "block_mined".equals(st.task.successPredicate())
                 && blockKey.equals(TaskSpec.argStr(st.task.successArgs(), "block", ""));
-        if (isTarget) {
+        if (isTarget && isCorrectTool(player, blockKey)) {
             st.bump("block_mined", blockKey);
             checkSuccess(player, st);
         } else {
@@ -112,6 +125,35 @@ public final class TaskManager {
                 st.rewardSinceLastStep -= penalty;
             }
         }
+    }
+
+    /**
+     * 受控三类采集任务只接受正确工具完成的目标挖掘：石头→镐、泥土→铲、原木→斧。
+     * 服务器在 BlockBreakEvent 处判定，避免客户端错误选槽仍被记为任务进度。
+     */
+    private boolean isCorrectTool(Player player, String blockKey) {
+        String required;
+        switch (blockKey) {
+            case "minecraft:stone" -> required = "pickaxe";
+            case "minecraft:dirt" -> required = "shovel";
+            case "minecraft:oak_log" -> required = "axe";
+            default -> {
+                return true;
+            }
+        }
+        ItemStack held = player.getInventory().getItemInMainHand();
+        if (held == null || held.getType().isAir()) {
+            plugin.getLogger().info("[task] " + player.getName() + " broke " + blockKey
+                    + " with empty hand; required=" + required);
+            return false;
+        }
+        Material item = held.getType();
+        boolean correct = item.getKey().getKey().contains(required);
+        if (!correct) {
+            plugin.getLogger().info("[task] " + player.getName() + " broke " + blockKey
+                    + " with " + item.getKey() + "; required=" + required);
+        }
+        return correct;
     }
 
     public void onBlockPlace(Player player, String blockKey) {

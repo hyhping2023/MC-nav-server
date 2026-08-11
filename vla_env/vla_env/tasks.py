@@ -4,7 +4,7 @@ Python 侧任务知识的**单一来源**：目标块集合、方块→工具映
 参数。此前散落在 task_runner.TOOL_FOR_BLOCK / interact.KIT_* / demo_human 里的
 表全部收拢到这里；新增任务 = 服务端加一个 tasks/*.json + 此处加一个 profile。
 
-kit 约束（M11）：固定生存工具包 镐/剑/铲/泥土（hotbar 0-3），任务局限在这四类。
+kit 约束（M11/M11.7）：固定生存工具包 镐/剑/铲/泥土/斧（hotbar 0-4），任务局限在这五类。
 """
 
 from __future__ import annotations
@@ -12,16 +12,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Optional
 
-# M11 固定生存工具包（与服务端 TaskRegistry.SURVIVAL_KIT 一致），hotbar 0-3。
+# M11 固定生存工具包（reset_world 经 items 参数授予，与服务端 TaskRegistry.SURVIVAL_KIT
+# 顺序一致），hotbar 0-4。
 SURVIVAL_KIT = [
     "minecraft:diamond_pickaxe",   # 0：挖石头
     "minecraft:diamond_sword",     # 1：近战（杀猪）
     "minecraft:diamond_shovel",    # 2：铲泥土
     "minecraft:dirt@64",           # 3：放置方块
+    "minecraft:diamond_axe",       # 4：砍树（collect_wood）
 ]
 
 # 工具类别 → kit hotbar 槽位。
-KIT_TOOL_SLOT = {"pickaxe": 0, "sword": 1, "shovel": 2, "dirt": 3}
+KIT_TOOL_SLOT = {"pickaxe": 0, "sword": 1, "shovel": 2, "dirt": 3, "axe": 4}
 
 # 方块 → 工具注册名（规划器写进 dig 计划；客户端 BlockTraits.toolFor 为运行时兜底）。
 TOOL_FOR_BLOCK: Dict[str, str] = {
@@ -46,17 +48,18 @@ TOOL_FOR_BLOCK: Dict[str, str] = {
     "minecraft:sand": "minecraft:diamond_shovel",
     "minecraft:gravel": "minecraft:diamond_shovel",
     "minecraft:clay": "minecraft:diamond_shovel",
-    # 斧（完整钻石套装任务用；kit 任务不含）
+    # 斧
     "minecraft:oak_log": "minecraft:diamond_axe",
     "minecraft:oak_planks": "minecraft:diamond_axe",
     "minecraft:oak_leaves": "minecraft:diamond_axe",
 }
 
-# 工具注册名 → kit 槽位（在 kit 内则给出槽位；斧等不在 kit → None）。
+# 工具注册名 → kit 槽位（在 kit 内则给出槽位；不在 kit 内的工具 → None）。
 _TOOL_SLOT_BY_ID = {
     "minecraft:diamond_pickaxe": 0,
     "minecraft:diamond_sword": 1,
     "minecraft:diamond_shovel": 2,
+    "minecraft:diamond_axe": 4,
 }
 
 
@@ -97,10 +100,10 @@ class TaskProfile:
 # 演示任务名（demo_human --task）→ profile。
 PROFILES: Dict[str, TaskProfile] = {
     "dig_stone": TaskProfile(
-        task_id="collect_stone", kind="dig", tool_slot=KIT_TOOL_SLOT["pickaxe"], count=8,
+        task_id="collect_stone", kind="dig", tool_slot=KIT_TOOL_SLOT["pickaxe"], count=4,
         target_blocks=frozenset({"minecraft:stone"})),
     "dig_dirt": TaskProfile(
-        task_id="dig_dirt", kind="dig", tool_slot=KIT_TOOL_SLOT["shovel"], count=6,
+        task_id="dig_dirt", kind="dig", tool_slot=KIT_TOOL_SLOT["shovel"], count=4,
         target_blocks=frozenset({"minecraft:dirt"})),
     "kill_animal": TaskProfile(
         task_id="kill_animal", kind="kill", tool_slot=KIT_TOOL_SLOT["sword"], count=2,
@@ -108,6 +111,9 @@ PROFILES: Dict[str, TaskProfile] = {
     "place_dirt": TaskProfile(
         task_id="place_dirt", kind="place", tool_slot=KIT_TOOL_SLOT["dirt"], count=3,
         place_block="minecraft:dirt"),
+    "collect_wood": TaskProfile(
+        task_id="collect_wood", kind="dig", tool_slot=KIT_TOOL_SLOT["axe"], count=4,
+        target_blocks=frozenset({"minecraft:oak_log"})),
 }
 
 

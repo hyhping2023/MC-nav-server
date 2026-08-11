@@ -4,10 +4,13 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import org.bukkit.Bukkit;
+import org.bukkit.Difficulty;
 import org.bukkit.GameMode;
 import org.bukkit.GameRule;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
@@ -39,9 +42,7 @@ public final class ResetEngine {
         public boolean clearInventory = true;
         /** 初始物品（reset 前先清空背包再按序给予）。 */
         public final List<ItemStack> initialItems = new ArrayList<>();
-        /** 固定时间（time of day，默认 6000 = 正午）。 */
-        public long time = 6000;
-        /** M11 确定性种子（ResetRequest.seed）：记录用于回放校验/日志，本身不改变地形。 */
+        /** M11 确定性种子（ResetRequest.seed）：决定 episode 的时间、天气与目标位置。 */
         public int seed = 0;
 
         public void setCenter(int x, int y, int z) {
@@ -104,7 +105,11 @@ public final class ResetEngine {
         // 2. 清实体：区域内非 Player 全部 remove（掉落物也是实体，一并清）
         clearNonPlayerEntities(world, cx, cy, cz, extent);
 
-        // 3. 回滚方块：首次 capture 基线并缓存；后续从缓存恢复（保证确定性）
+        // 3. 清理上一个 episode 的柱/树，再首次 capture 干净基线并缓存。服务端重启时
+        // ObjectPlacer 的内存索引会丢失，不能依赖它来清理持久化的旧目标。
+        clearAboveSurface(world, cx, cy, cz, extent);
+
+        // 4. 回滚方块：首次 capture 基线并缓存；后续从缓存恢复（保证确定性）
         String key = cacheKey(world.getName(), cx, cy, cz, extent);
         RegionSnapshot snapshot = baselineCache.get(key);
         if (snapshot == null) {
@@ -113,7 +118,7 @@ public final class ResetEngine {
         }
         snapshot.restore(world);
 
-        // 4. 玩家态重置
+        // 5. 玩家态重置
         Location spawn = spec.spawn != null ? spec.spawn : world.getSpawnLocation();
         player.teleport(spawn);
         if (spec.clearInventory) {
@@ -132,15 +137,14 @@ public final class ResetEngine {
         player.setFallDistance(0f);
         player.setGameMode(GameMode.SURVIVAL);
 
-        // 5. gamerule 冻结（幂等，§4.3 确定性配置）
+        // 6. gamerule 冻结（幂等，§4.3 确定性配置）
         freezeGamerules(world);
 
-        // 6. 时间/天气
-        world.setTime(spec.time);
-        world.setStorm(false);
-        world.setThundering(false);
+        // 7. Episode 环境随机化（同 seed 可复现）：白昼系 80%（日间/黎明/黄昏），
+        // 夜间 20%；天气在晴天/雨/雷雨间采样。困难度固定和平，昼夜/天气循环冻结。
+        applyEpisodeEnvironment(world, spec.seed);
 
-        // 7. 初始物品（先 clear 再加）：前 9 个显式放入 hotbar 0-8（确定性槽位），
+        // 8. 初始物品（先 clear 再加）：前 9 个显式放入 hotbar 0-8（确定性槽位），
         //    超出部分 addItem；存在初始物品时选中槽归零（镐 0），避免上一 episode 选中槽残留。
         ItemStack[] initial = spec.initialItems.toArray(new ItemStack[0]);
         for (int i = 0; i < initial.length && i < 9; i++) {
@@ -193,6 +197,24 @@ public final class ResetEngine {
         }
     }
 
+    /** 清理受控平面上方的遗留人工方块，保留 y<=63 的单材质地表及其地下基底。 */
+    private void clearAboveSurface(World world, int cx, int cy, int cz, int extent) {
+        int minY = Math.max(ControlledSurface.Y + 1, world.getMinHeight());
+        int maxY = Math.min(cy + extent, world.getMaxHeight() - 1);
+        if (minY > maxY) {
+            return;
+        }
+        for (int x = cx - extent; x <= cx + extent; x++) {
+            for (int z = cz - extent; z <= cz + extent; z++) {
+                for (int y = minY; y <= maxY; y++) {
+                    if (!world.getBlockAt(x, y, z).getType().isAir()) {
+                        world.getBlockAt(x, y, z).setType(Material.AIR, false);
+                    }
+                }
+            }
+        }
+    }
+
     private int countNonPlayerEntities(World world, int cx, int cy, int cz, int extent) {
         int n = 0;
         for (Entity e : regionEntities(world, cx, cy, cz, extent)) {
@@ -217,10 +239,46 @@ public final class ResetEngine {
         world.setGameRule(GameRule.RANDOM_TICK_SPEED, 0);
     }
 
+    /**
+     * 初始化一个可复现的录制场景。
+     *
+     * <p>时间分布满足「白昼系 : 夜间 = 8 : 2」：
+     * 明亮白天 50%、黎明 15%、黄昏 15%、夜间 20%。天气为晴 60%、雨 32%、雷雨 8%。
+     * 世界规则已冻结，故录制过程中光照和天气不会漂移；和平难度保证没有敌对生物干扰构造。
+     */
+    private void applyEpisodeEnvironment(World world, int seed) {
+        Random rng = new Random(0x564c415f454e564cL ^ seed);
+        int slot = rng.nextInt(100);
+        long time;
+        if (slot < 50) {
+            time = 3_000L + rng.nextInt(6_000);     // 明亮白天
+        } else if (slot < 65) {
+            time = 23_000L + rng.nextInt(1_000);    // 黎明
+        } else if (slot < 80) {
+            time = 12_000L + rng.nextInt(1_000);    // 黄昏
+        } else {
+            time = 16_000L + rng.nextInt(6_000);    // 夜间
+        }
+        int weather = rng.nextInt(100);
+        boolean storm = weather >= 60;
+        boolean thunder = weather >= 92;
+        world.setTime(time);
+        world.setStorm(storm);
+        world.setThundering(thunder);
+        world.setWeatherDuration(1_000_000);
+        world.setThunderDuration(1_000_000);
+        world.setDifficulty(Difficulty.PEACEFUL);
+    }
+
     private String playerSummary(Player player) {
         Location loc = player.getLocation();
         return String.format("pos=(%.1f,%.1f,%.1f) hp=%.0f food=%d sat=%.0f",
                 loc.getX(), loc.getY(), loc.getZ(),
                 player.getHealth(), player.getFoodLevel(), player.getSaturation());
+    }
+
+    /** 避免 reset 包依赖插件实现类，仅集中定义受控地表高度常量。 */
+    private static final class ControlledSurface {
+        static final int Y = 63;
     }
 }

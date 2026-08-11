@@ -56,6 +56,7 @@ class MinecraftEnv(_GymEnvBase):
         self,
         player: str = "agent0",
         task: str = "collect_wood",
+        surface: Optional[str] = None,
         ws_url: str = "ws://127.0.0.1:30001",
         grpc_host: str = "127.0.0.1",
         grpc_port: int = 50051,
@@ -64,6 +65,7 @@ class MinecraftEnv(_GymEnvBase):
     ) -> None:
         self.player = player
         self.task = task
+        self.surface = surface
         self.ticks_per_step = int(ticks_per_step)
         self.res = int(res)
         self._episode_count = 0
@@ -133,8 +135,17 @@ class MinecraftEnv(_GymEnvBase):
         """
         if task is not None:
             self.task = task
+        if options and options.get("surface") is not None:
+            self.surface = str(options["surface"])
         self._episode_count += 1
         self.episode_id = f"ep-{self._episode_count:06d}"
+
+        # 并发持久 worker 会在进程启动时一次性绑定 worker 专属世界，后续每个
+        # episode 只 reset；否则这里保留兼容行为：surface 变化时自动选择世界。
+        select_surface = not bool(options and options.get("reuse_selected_surface"))
+        if self.surface is not None and select_surface:
+            self.grpc.select_surface_world(
+                player=self.player, surface=self.surface, seed=int(seed or 0))
 
         resp = self.grpc.reset_world(player=self.player, task=self.task, seed=seed)
         if not resp.get("ok"):

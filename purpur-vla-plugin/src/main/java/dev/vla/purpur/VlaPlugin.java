@@ -8,6 +8,8 @@ import dev.vla.purpur.player.AgentManager;
 import dev.vla.purpur.reset.ResetEngine;
 import dev.vla.purpur.task.TaskManager;
 import dev.vla.purpur.task.TaskSpec;
+import dev.vla.purpur.world.ControlledPlainsGenerator;
+import dev.vla.purpur.world.SurfaceWorldManager;
 import dev.vla.purpur.world.VoxelReader;
 import io.grpc.Server;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
@@ -55,6 +57,51 @@ public class VlaPlugin extends JavaPlugin implements Listener {
     private ResetEngine resetEngine;
     private TaskManager taskManager;
     private PathVisualizer pathVisualizer;
+    private SurfaceWorldManager surfaceWorldManager;
+
+    /** 单材质元世界的自然地面保护：y<=surfaceY 的方块不可破坏。 */
+    private volatile boolean groundProtected = false;
+    private volatile int protectedSeaLevel = ControlledPlainsGenerator.SURFACE_Y;
+    /** 默认元世界完成创建前不接受任务目标投放。 */
+    private volatile boolean worldReady = false;
+
+    public void setGroundProtected(boolean v) {
+        this.groundProtected = v;
+    }
+
+    public void setProtectedSeaLevel(int seaLevel) {
+        this.protectedSeaLevel = seaLevel;
+    }
+
+    public boolean isWorldReady() {
+        return worldReady;
+    }
+
+    public SurfaceWorldManager.Selection selectSurfaceWorld(Player player, String surface, long seed) {
+        if (surfaceWorldManager == null) {
+            throw new IllegalStateException("surface world manager is not initialized");
+        }
+        SurfaceWorldManager.Selection selected = surfaceWorldManager.select(player, surface, seed);
+        // 新建并发 worker world 同样需要进入“受控环境就绪”状态。地面保护规则
+        // 不依赖 primary world；所有 vla_surface_* 世界均使用相同 Y=63 地表契约。
+        setGroundProtected(true);
+        setProtectedSeaLevel(ControlledPlainsGenerator.SURFACE_Y);
+        worldReady = true;
+        return selected;
+    }
+
+    /**
+     * Bukkit 在创建 {@code bukkit.yml} 中配置为 {@code vla-purpur:controlled_plains}
+     * 的世界时调用。生成器直接生成单材质平面，不做启动后地形修改。
+     */
+    @Override
+    public ControlledPlainsGenerator getDefaultWorldGenerator(String worldName, String id) {
+        if ("controlled_plains".equalsIgnoreCase(id)) {
+            getLogger().info("[world] providing controlled_plains generator for " + worldName);
+            return new ControlledPlainsGenerator(SurfaceWorldManager.surfaceForWorldName(worldName));
+        }
+        return null;
+    }
 
     @Override
     public void onEnable() {
@@ -64,6 +111,7 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         this.resetEngine = new ResetEngine();
         this.taskManager = new TaskManager(this);
         this.pathVisualizer = new PathVisualizer(this);
+        this.surfaceWorldManager = new SurfaceWorldManager(this);
         Bukkit.getPluginManager().registerEvents(agentManager, this);
         // M5：任务相关事件（方块破坏/放置、实体死亡、玩家移动 → TaskManager 判定）
         Bukkit.getPluginManager().registerEvents(this, this);
@@ -80,6 +128,24 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         // 客户端据此给帧打 last_server_tick，供 Python lockstep 对齐（§9.3）。
         Bukkit.getMessenger().registerOutgoingPluginChannel(this, TICK_CHANNEL);
         Bukkit.getScheduler().runTaskTimer(this, this::broadcastTick, 20L, 1L);
+
+        // 受控环境由自定义 ChunkGenerator 首次生成：y=63 为固定单材质地表，y>=64
+        // 为空气。插件只管理存档、元数据和地面保护，绝不启动后回填/削平地形。
+        World primaryWorld = Bukkit.getWorlds().isEmpty() ? null : Bukkit.getWorlds().get(0);
+        if (primaryWorld != null) {
+            markControlledWorldReady(primaryWorld);
+        } else {
+            // load: STARTUP 时插件会早于默认世界启用；延后一 tick，等世界创建和自定义
+            // generator 挂载完成后再开启任务与地面保护。
+            Bukkit.getScheduler().runTask(this, () -> {
+                World createdWorld = Bukkit.getWorlds().isEmpty() ? null : Bukkit.getWorlds().get(0);
+                if (createdWorld == null) {
+                    getLogger().warning("[world] primary world was not created after startup");
+                    return;
+                }
+                markControlledWorldReady(createdWorld);
+            });
+        }
 
         try {
             grpcServer = NettyServerBuilder
@@ -156,6 +222,15 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private void markControlledWorldReady(World world) {
+        setGroundProtected(true);
+        setProtectedSeaLevel(ControlledPlainsGenerator.SURFACE_Y);
+        worldReady = true;
+        java.nio.file.Path metadata = surfaceWorldManager.registerExistingWorld(world);
+        getLogger().info("[world] controlled single-surface plains ready at "
+                + world.getSpawnLocation() + " metadata=" + metadata);
+    }
+
     /** 供命令/日志探测 gRPC server 是否仍处于运行状态。 */
     public boolean isGrpcListening() {
         return grpcServer != null && !grpcServer.isShutdown() && !grpcServer.isTerminated();
@@ -182,6 +257,8 @@ public class VlaPlugin extends JavaPlugin implements Listener {
                 return vlaVoxels(sender, args);
             case "path":
                 return vlaPath(sender, args);
+            case "surface":
+                return vlaSurface(sender, args);
             case "reloadtasks": {
                 int n = dev.vla.purpur.task.TaskRegistry.loadFromDir(
                         new java.io.File(getDataFolder(), "tasks"), getLogger());
@@ -198,7 +275,9 @@ public class VlaPlugin extends JavaPlugin implements Listener {
     private void usage(CommandSender sender) {
         sender.sendMessage("Usage: /vla status | /vla reset <player> [halfExtent] | /vla verify <player>"
                 + " | /vla task <player> <task> | /vla taskinfo <player>"
-                + " | /vla voxels <player> [r] | /vla path <x> <y> <z> [mode] | /vla reloadtasks");
+                + " | /vla voxels <player> [r] | /vla path <x> <y> <z> [mode]"
+                + " | /vla surface <player> <surface> [seed]"
+                + " | /vla reloadtasks");
     }
 
     /** {@code /vla status}：输出 tick/tps/gRPC 端口（保留 M1）。 */
@@ -311,7 +390,11 @@ public class VlaPlugin extends JavaPlugin implements Listener {
             sender.sendMessage("[vla-purpur] task: player not found: " + args[1]);
             return true;
         }
-        TaskSpec spec = taskManager.setTask(player, args[2]);
+        if (!worldReady) {
+            sender.sendMessage("[vla-purpur] task: world initialization is still running");
+            return true;
+        }
+        TaskSpec spec = taskManager.setTask(player, args[2], 0L);
         if (spec == null) {
             sender.sendMessage("[vla-purpur] task: unknown task: " + args[2]
                     + " (known: collect_wood, craft_planks, collect_stone, kill_animal)");
@@ -438,10 +521,49 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    /** 选择/创建单材质元世界，并将玩家传送到该世界的固定平面出生点。 */
+    private boolean vlaSurface(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            sender.sendMessage("Usage: /vla surface <player> <surface> [seed]");
+            sender.sendMessage("  surfaces: "
+                    + String.join(", ", SurfaceWorldManager.availableSurfaces().keySet()));
+            return true;
+        }
+        Player player = agentManager.resolve(args[1]);
+        if (player == null) {
+            sender.sendMessage("[vla-purpur] surface: player not found: " + args[1]);
+            return true;
+        }
+        long seed = 0L;
+        if (args.length >= 4) {
+            try {
+                seed = Long.parseLong(args[3]);
+            } catch (NumberFormatException e) {
+                sender.sendMessage("[vla-purpur] surface: bad seed: " + args[3]);
+                return true;
+            }
+        }
+        try {
+            SurfaceWorldManager.Selection selection = selectSurfaceWorld(player, args[2], seed);
+            sender.sendMessage("[vla-purpur] surface selected: world="
+                    + selection.world().getName() + " material=" + selection.material().getKey()
+                    + " created=" + selection.created() + " meta=" + selection.metadataPath());
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            sender.sendMessage("[vla-purpur] surface: " + e.getMessage());
+        }
+        return true;
+    }
+
     // ---- M5 事件监听（→ TaskManager 判定，§4.7）----
 
     @EventHandler
     public void onBlockBreak(BlockBreakEvent event) {
+        // 单材质元世界的自然地面受保护；只有任务生成的柱子/树（y>surfaceY）可挖。
+        // 取消的 break 不计入任务判定。
+        if (groundProtected && event.getBlock().getY() <= protectedSeaLevel) {
+            event.setCancelled(true);
+            return;
+        }
         taskManager.onBlockBreak(event.getPlayer(),
                 event.getBlock().getType().getKey().toString());
     }

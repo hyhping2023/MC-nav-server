@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """M11.5 人类式按键录制 demo（DESIGN.md §17，编排器版）。
 
-按 --task 用固定生存工具包（镐/剑/铲/泥土，hotbar 0-3）**模拟人类执行**操作，
+按 --task 用固定生存工具包（镐/剑/铲/泥土/斧，hotbar 0-4）**模拟人类执行**操作，
 录制 frame↔按键对齐的数据。架构（§17.2）：客户端为手（NavExecutor/PillarExecutor
 + Humanizer 人类化整形逐 tick 合成按键），Python KitAgent 为脑（选目标/粗航点/
 技能派发/脱困决策），服务端为世界与裁判（任务判定/奖励/粗航点/确定性重置）。
@@ -11,11 +11,15 @@
     .venv/bin/python -u scripts/demo_human.py [outdir] --task kill_animal --seed 11 --tail-seconds 12
     .venv/bin/python -u scripts/demo_human.py --replay <episode_dir>   # 种子回放
 
-任务（kit 局限：镐/剑/铲/泥土）：
-    dig_stone   → collect_stone（挖 8 石头，镐）
-    dig_dirt    → dig_dirt（挖 6 泥土，铲）
-    kill_animal → kill_animal（杀 2 猪，剑）
-    place_dirt  → place_dirt（放置 3 泥土）
+任务（kit：镐/剑/铲/泥土/斧，hotbar 0-4）：
+    dig_stone    → collect_stone（挖 4 格石柱，镐）
+    dig_dirt     → dig_dirt（挖 4 格泥土柱，铲）
+    kill_animal  → kill_animal（杀 2 猪，剑）
+    place_dirt   → place_dirt（放置 3 泥土）
+    collect_wood → collect_wood（砍 4 原木，斧）
+
+受控平原由服务端插件启动时自动初始化；每次 SetTask 只投放当前任务的一根石柱、
+泥土柱或一棵树，无需再手工 flatten / place_objects。
 
 输出（outdir + 同名 mp4，契约见 §17.4）：
     meta.json / trajectory.jsonl（逐帧按键状态=训练对）/ frames/*.jpg /
@@ -29,17 +33,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
-import time
 from collections import defaultdict
 from pathlib import Path
 
 from vla_env.interact import SeedReplayApi
-from vla_env.dataset.human_recorder import HumanRecorder
-from vla_env.orchestrator import KitAgent
+from vla_env.dataset.human_episode import EpisodeConfig, record_human_episode
 from vla_env.tasks import PROFILES, SURVIVAL_KIT, get_profile
-from vla_env.action_space import BUTTONS
 
 # 本脚本以 `python scripts/demo_human.py` 运行，sys.path[0]=scripts/，
 # 故 demo_task / collect_wood_agent 是裸导入（scripts/ 不是包）。
@@ -138,14 +138,22 @@ def parse_args() -> argparse.Namespace:
                    help="输出目录（默认 datasets/demo_human/<task>_<seed>_<ts>）")
     p.add_argument("--task", choices=list(PROFILES), default="dig_stone",
                    help="dig_stone（镐挖石）/ dig_dirt（铲挖土）/ kill_animal（剑杀猪）/ "
-                        "place_dirt（放置泥土）")
+                        "place_dirt（放置泥土）/ collect_wood（斧砍树）")
     p.add_argument("--seed", type=int, default=42, help="episode 种子（同 seed 确定性可回放）")
+    p.add_argument("--surface", default="grass_block",
+                   help="单材质元世界：grass_block/dirt/coarse_dirt/sand/red_sand/stone/"
+                        "granite/diorite/andesite/clay（默认 grass_block）")
     p.add_argument("--max-steps", type=int, default=600)
-    p.add_argument("--tail-seconds", type=float, default=10.0,
+    p.add_argument("--tail-seconds", type=float, default=0.0,
                    help="任务完成后额外录制 N 秒收尾环视（慢速转镜，加长 demo 视频）；0 关闭")
     p.add_argument("--ticks", type=int, default=2)
-    p.add_argument("--half-extent", type=int, default=16)
+    p.add_argument("--half-extent", type=int, default=16,
+                   help="体素扫描/重置区域半宽（默认 16：覆盖任务目标环 6-12 格）")
     p.add_argument("--player", default="agent0")
+    p.add_argument("--ws-url", default="ws://127.0.0.1:30001",
+                   help="Fabric client WS 地址（多 worker 时每个客户端不同）")
+    p.add_argument("--grpc-host", default="127.0.0.1")
+    p.add_argument("--grpc-port", type=int, default=50051)
     p.add_argument("--spawn", default=None,
                    help="自定义出生点 x,y,z[,yaw]（M11.5 难点③），如 --spawn -20,68,-140")
     p.add_argument("--capture", default="native",
@@ -217,11 +225,15 @@ def run_replay(episode_dir: str, args: argparse.Namespace) -> int:
         return 1
     seed = meta.get("seed", 0)
     task_id = meta.get("task_id", "collect_stone")
+    surface = meta.get("surface")
     spawn = meta.get("spawn")
 
-    api = SeedReplayApi(player=args.player, ticks_per_step=1)
+    api = SeedReplayApi(player=args.player, ws_url=args.ws_url,
+                        grpc_host=args.grpc_host, grpc_port=args.grpc_port,
+                        ticks_per_step=1)
     try:
-        frame, obs = api.reset(seed=seed, task=task_id, items=SURVIVAL_KIT, spawn=spawn)
+        frame, obs = api.reset(seed=seed, task=task_id, surface=surface,
+                               items=SURVIVAL_KIT, spawn=spawn)
         n = 0
         progress = 0.0
         frames = 0
@@ -246,11 +258,6 @@ def main() -> int:
     if args.replay:
         return run_replay(args.replay, args)
 
-    profile = get_profile(args.task)
-    task = profile.task_id
-    spawn = None
-    if args.spawn:
-        spawn = [float(v) for v in args.spawn.split(",")]
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
                                         "datasets", "demo_human"))
     outdir = args.outdir or os.path.join(
@@ -258,142 +265,36 @@ def main() -> int:
     os.makedirs(outdir, exist_ok=True)
     mp4_path = outdir + ".mp4"
 
-    api = SeedReplayApi(player=args.player, ticks_per_step=args.ticks)
+    api = SeedReplayApi(player=args.player, ws_url=args.ws_url,
+                        grpc_host=args.grpc_host, grpc_port=args.grpc_port,
+                        ticks_per_step=args.ticks)
     try:
-        # 1. 确定性重置（重试）+ 人类化整形
-        obs = None
-        for attempt in range(30):
-            try:
-                frame, obs = api.reset(seed=args.seed, task=task, items=SURVIVAL_KIT,
-                                       spawn=spawn, humanize=not args.no_humanize)
-                break
-            except Exception as e:  # noqa: BLE001
-                print(f"[reset] attempt {attempt + 1} failed: {type(e).__name__}: {e}",
-                      file=sys.stderr)
-                time.sleep(2)
-        if obs is None:
-            print("HUMAN_DEMO_FAIL: env.reset 未成功", file=sys.stderr)
-            return 1
-        print(f"[reset] OK seed={args.seed} pos={obs['player']['pos']} "
-              f"checksum={api.last_checksum}", flush=True)
-
-        # 2. 目标供给（seed 确定性；真实世界资源优先，不足才人工放置）
-        rng = random.Random(args.seed)
-        if profile.kind == "kill":
-            if not args.no_provision and _ensure_pigs(api, rng, args.half_extent,
-                                                      profile.count) == 0:
-                print("HUMAN_DEMO_FAIL: 未放置任何猪（周围地形不合适）", file=sys.stderr)
-                return 1
-        elif args.task == "dig_stone" and not args.no_provision:
-            natural = _count_reachable(api, "minecraft:stone", args.half_extent)
-            print(f"  [provision] natural reachable stone = {natural}", flush=True)
-            if natural < profile.count:
-                _ensure_stone(api, rng, args.half_extent, need=profile.count)
-        elif args.task == "dig_dirt":
-            natural = _count_reachable(api, "minecraft:dirt", args.half_extent)
-            print(f"  [provision] natural reachable dirt = {natural}", flush=True)
-
-        # 3. 抓帧分辨率 + HUD（demo 视频完整 UI）
-        if args.capture.lower() == "native":
-            api.ws.send({"cmd": "set_capture", "width": 0, "height": 0})
-        else:
-            w, h = (int(x) for x in args.capture.lower().split("x"))
-            api.ws.send({"cmd": "set_capture", "width": w, "height": h})
-        time.sleep(0.5)
-        api.ws.send({"cmd": "set_capture_ui", "hud": not args.no_hud})
-        time.sleep(0.3)
-
-        # 排空 set_capture 前积压的旧分辨率帧（惰性 FBO 重建，见 native 帧宽）
-        drained = 0
-        for _ in range(120):
-            f = api.ws.recv_frame(timeout=0.5)
-            if f is None:
-                break
-            drained += 1
-            if f.rgb.shape[1] != 224:
-                break
-        print(f"[capture] drained={drained} capture={args.capture}", flush=True)
-
-        # 4. 录制器（后台录帧 + 排空事件；goto/pillar 状态经 poll_events 转发编排器）
-        ping = api.grpc.ping()
-        meta = {
-            "format": "m11_human_demo_v2",
-            "task": args.task,
-            "task_id": task,
-            "seed": args.seed,
-            "kit": SURVIVAL_KIT,
-            "player": args.player,
-            "spawn": spawn,
-            "humanize": not args.no_humanize,
-            "ticks_per_step": args.ticks,
-            "capture": args.capture,
-            "hud": not args.no_hud,
-            "world_name": ping["world_name"],
-            "mc_version": ping["version"],
-            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        }
-        recorder = HumanRecorder(outdir, meta)
-        recorder.start(api.ws)
-        api.ws.send_set_key_log(True)
-
-        # 5. 编排执行（客户端为手：逐 tick 按键由 NavExecutor/PillarExecutor+Humanizer 合成）
-        def step_fn(action, ticks):
-            api.ws.send_action(action)
-            step = api.grpc.get_step_result(player=api.player, await_ticks=ticks)
-            try:
-                state = api.grpc.get_state(player=api.player)
-                recorder.add_step(state, step["server_tick"], step["progress"])
-            except Exception:  # noqa: BLE001 —— 状态记录失败不阻塞策略
-                pass
-            return {"progress": float(step["progress"]), "terminated": step["terminated"],
-                    "truncated": step["truncated"], "reward": step["reward"]}
-
-        agent = KitAgent(api, profile, rng=random.Random(args.seed),
-                         half_extent=args.half_extent, recorder=recorder,
-                         on_no_target=(
-                             (lambda: _ensure_pigs(api, rng, args.half_extent, 1) > 0)
-                             if profile.kind == "kill" and not args.no_provision else None))
-        ok, steps, max_progress = agent.run(step_fn, max_steps=args.max_steps)
-
-        # M11.6 加长 demo：任务完成后继续录制一段"收尾环视"（慢速 360° 转镜，纯演示
-        # 画面，不推进任务/不干扰判定）。录帧由 recorder 后台线程持续进行，这里只喂
-        # 动作并同步状态行，保证帧↔tick 对齐断言持续有效。
-        if args.tail_seconds > 0:
-            tail_ticks = int(args.tail_seconds * 20)     # 20 tps
-            yaw_delta = 360.0 / max(1, tail_ticks)       # 全程一圈
-            for _ in range(tail_ticks):
-                idle = {name: False for name in BUTTONS}
-                idle["hotbar"] = -1
-                idle["camera"] = [0.0, yaw_delta]
-                api.ws.send_action(idle)
-                step = api.grpc.get_step_result(player=api.player, await_ticks=1)
-                try:
-                    state = api.grpc.get_state(player=api.player)
-                    recorder.add_step(state, step["server_tick"], float(step["progress"]))
-                except Exception:  # noqa: BLE001
-                    pass
-            print(f"[tail] post-completion pan {tail_ticks} ticks ({args.tail_seconds}s)",
-                  flush=True)
-
-        # 6. 收尾
-        api.ws.send_set_key_log(False)
-        time.sleep(0.5)
-        summary = recorder.finalize({
-            "success": ok, "steps": steps, "progress": max_progress, "seed": args.seed})
-        align_ok = bool(summary["align_ok"]) and summary["frames"] > 0
-
-        if not os.listdir(os.path.join(outdir, "frames")):
-            print("HUMAN_DEMO_FAIL: 无帧产出", file=sys.stderr)
-            return 1
-        if not compose_mp4(os.path.join(outdir, "frames"), mp4_path):
-            print("HUMAN_DEMO_FAIL: ffmpeg 合成失败", file=sys.stderr)
-            return 1
-
-        print(f"HUMAN_DEMO_OK task={args.task} task_id={task} seed={args.seed} "
-              f"steps={steps} progress={max_progress:.2f} frames={summary['frames']} "
-              f"key_events={summary['key_events']} semantic={summary['semantic_actions']} "
-              f"align_ok={align_ok} dir={outdir}", flush=True)
-        return 0 if ok and align_ok else 1
+        result = record_human_episode(
+            api,
+            EpisodeConfig(
+                outdir=outdir,
+                task=args.task,
+                seed=args.seed,
+                surface=args.surface,
+                max_steps=args.max_steps,
+                ticks=args.ticks,
+                half_extent=args.half_extent,
+                capture=args.capture,
+                hud=not args.no_hud,
+                humanize=not args.no_humanize,
+                provision=not args.no_provision,
+                spawn=args.spawn,
+                tail_seconds=args.tail_seconds,
+            ),
+            compose_mp4=compose_mp4,
+        )
+        summary = result["summary"]
+        print(f"HUMAN_DEMO_OK task={args.task} task_id={get_profile(args.task).task_id} "
+              f"seed={args.seed} steps={result['steps']} progress={result['progress']:.2f} "
+              f"frames={summary['frames']} key_events={summary['key_events']} "
+              f"semantic={summary['semantic_actions']} align_ok={result['align_ok']} "
+              f"dir={outdir}", flush=True)
+        return 0 if result["ok"] else 1
     finally:
         api.close()
 

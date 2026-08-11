@@ -4,6 +4,7 @@
 # 用法：
 #   bash start.sh
 #   VLA_SERVER_PIPE=/tmp/my_pipe bash start.sh   # 自定义管道路径
+#   VLA_SERVER_XMS=1G VLA_SERVER_XMX=4G bash start.sh  # Java heap 上限
 #
 # 服务端控制台 stdin 来自 FIFO 命名管道（默认 /tmp/vla_server_console），
 # 外部脚本可用 `echo "<command>" > "$PIPE"` 发送命令（见 freeze_gamerules.sh）。
@@ -19,6 +20,8 @@ if [ ! -x "$JAVA" ]; then
 fi
 
 PIPE="${VLA_SERVER_PIPE:-/tmp/vla_server_console}"
+XMS="${VLA_SERVER_XMS:-1G}"
+XMX="${VLA_SERVER_XMX:-4G}"
 
 # FIFO 不存在则创建；已存在（管道或普通文件残留）则清理重建
 if [ ! -p "$PIPE" ]; then
@@ -36,7 +39,7 @@ mkdir -p logs
 LOG="logs/latest.log"
 
 echo "[start.sh] JAVA=$JAVA"
-echo "[start.sh] starting Purpur 1.20.1 (Xms2G Xmx4G, nogui) ..."
+echo "[start.sh] starting Purpur 1.20.1 (Xms${XMS} Xmx${XMX}, nogui) ..."
 
 # 用「读+写」方式持有 FIFO 文件描述符：
 #  - 作为控制台 stdin，外部脚本 `echo "<cmd>" > "$PIPE"` 即送入服务端；
@@ -44,7 +47,7 @@ echo "[start.sh] starting Purpur 1.20.1 (Xms2G Xmx4G, nogui) ..."
 #  - 服务端退出后脚本随即退出，不会残留阻塞在 FIFO 上的 tail 进程
 #    （tail -f 管道方案在服务端退出后 tail 仍阻塞读 FIFO，导致脚本悬挂并污染下次启动）。
 exec 3<>"$PIPE"
-"$JAVA" -Xms2G -Xmx4G -jar purpur.jar nogui <&3
+"$JAVA" "-Xms${XMS}" "-Xmx${XMX}" -jar purpur.jar nogui <&3
 EXIT=$?
 echo "[start.sh] server stopped (exit=$EXIT)"
 exit "$EXIT"

@@ -56,12 +56,13 @@ public final class TaskRegistry {
         add(PLACE_BLOCK);
     }};
 
-    /** M11 固定生存工具包（hotbar 0-3）：镐/剑/铲 + 泥土方块（人类演示录制用）。 */
+    /** 受控采集任务固定工具包（hotbar 0-4）：镐/剑/铲/泥土/斧。 */
     public static final List<String> SURVIVAL_KIT = List.of(
             "minecraft:diamond_pickaxe",   // 0：挖石头
             "minecraft:diamond_sword",     // 1：近战（杀猪）
             "minecraft:diamond_shovel",    // 2：铲泥土
-            "minecraft:dirt@64");          // 3：放置方块
+            "minecraft:dirt@64",           // 3：垫方块
+            "minecraft:diamond_axe");      // 4：砍树
 
     private TaskRegistry() {
     }
@@ -79,7 +80,7 @@ public final class TaskRegistry {
                 "block_mined",
                 collectArgs,
                 6000,
-                INITIAL_ITEMS,
+                SURVIVAL_KIT,
                 DEFAULT_DIG_PENALTY));
 
         // craft_planks 占位：predicate=inventory_contains，本回合（M5）不验收
@@ -99,17 +100,17 @@ public final class TaskRegistry {
 
         Map<String, Object> stoneArgs = new LinkedHashMap<>();
         stoneArgs.put("block", "minecraft:stone");
-        stoneArgs.put("count", 8);
+        stoneArgs.put("count", 4);
         register(new TaskSpec(
                 "collect_stone",
-                "Break 8 stone blocks.",
-                "挖 8 个石头。",
+                "Break the 4-block stone pillar with a pickaxe.",
+                "用镐挖掉这根 4 格石柱。",
                 TaskSpec.TaskType.COLLECT,
                 1,
                 "block_mined",
                 stoneArgs,
                 6000,
-                INITIAL_ITEMS,
+                SURVIVAL_KIT,
                 DEFAULT_DIG_PENALTY));
 
         Map<String, Object> killArgs = new LinkedHashMap<>();
@@ -126,14 +127,14 @@ public final class TaskRegistry {
                 6000,
                 INITIAL_ITEMS));
 
-        // M11 生存工具包任务（镐/剑/铲/泥土）：物品 = SURVIVAL_KIT（hotbar 0-3）
+        // 受控生存工具包任务（镐/剑/铲/泥土/斧）：物品 = SURVIVAL_KIT（hotbar 0-4）
         Map<String, Object> dirtArgs = new LinkedHashMap<>();
         dirtArgs.put("block", "minecraft:dirt");
-        dirtArgs.put("count", 6);
+        dirtArgs.put("count", 4);
         register(new TaskSpec(
                 "dig_dirt",
-                "Break 6 dirt blocks with a shovel.",
-                "用铲子挖 6 个泥土。",
+                "Break the 4-block dirt pillar with a shovel.",
+                "用铲子挖掉这根 4 格泥土柱。",
                 TaskSpec.TaskType.COLLECT,
                 1,
                 "block_mined",

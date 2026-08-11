@@ -71,6 +71,11 @@ class VlaServerStub:
                 request_serializer=vla__pb2.TaskRequest.SerializeToString,
                 response_deserializer=vla__pb2.TaskReply.FromString,
                 _registered_method=True)
+        self.SelectSurfaceWorld = channel.unary_unary(
+                '/vla.VlaServer/SelectSurfaceWorld',
+                request_serializer=vla__pb2.SelectSurfaceWorldRequest.SerializeToString,
+                response_deserializer=vla__pb2.SelectSurfaceWorldReply.FromString,
+                _registered_method=True)
         self.GenerateTask = channel.unary_unary(
                 '/vla.VlaServer/GenerateTask',
                 request_serializer=vla__pb2.GenerateRequest.SerializeToString,
@@ -157,6 +162,13 @@ class VlaServerServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SelectSurfaceWorld(self, request, context):
+        """选择/创建一个单材质元世界，并把玩家传送到其平面出生点。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GenerateTask(self, request, context):
         """课程/LLM 生成任务。
         """
@@ -236,6 +248,11 @@ def add_VlaServerServicer_to_server(servicer, server):
                     servicer.SetTask,
                     request_deserializer=vla__pb2.TaskRequest.FromString,
                     response_serializer=vla__pb2.TaskReply.SerializeToString,
+            ),
+            'SelectSurfaceWorld': grpc.unary_unary_rpc_method_handler(
+                    servicer.SelectSurfaceWorld,
+                    request_deserializer=vla__pb2.SelectSurfaceWorldRequest.FromString,
+                    response_serializer=vla__pb2.SelectSurfaceWorldReply.SerializeToString,
             ),
             'GenerateTask': grpc.unary_unary_rpc_method_handler(
                     servicer.GenerateTask,
@@ -459,6 +476,33 @@ class VlaServer:
             '/vla.VlaServer/SetTask',
             vla__pb2.TaskRequest.SerializeToString,
             vla__pb2.TaskReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SelectSurfaceWorld(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vla.VlaServer/SelectSurfaceWorld',
+            vla__pb2.SelectSurfaceWorldRequest.SerializeToString,
+            vla__pb2.SelectSurfaceWorldReply.FromString,
             options,
             channel_credentials,
             insecure,

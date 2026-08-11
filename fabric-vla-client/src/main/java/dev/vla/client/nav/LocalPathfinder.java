@@ -35,8 +35,9 @@ import net.minecraft.world.World;
  * </ul>
  *
  * <p>动作集（每节点 ≤5 方向×3 动作）：
- * 同层走（直/斜，斜走无切角）/ step_up（1 格台，含头顶检查）/ fall 1..3 /
- * dig-through（前方脚格+头格可挖穿，成本 digCost）。2+ 格高差交给服务端 A*。
+ * 同层走（直/斜，斜走无切角）/ fall 1..3 / dig-through（前方脚格+头格可挖穿，
+ * 成本 digCost）。受控平原任务禁用 step_up/dig_step_up：高处目标必须交由
+ * PillarExecutor 在脚底垫方块登高，而不是跳跃挖掘。
  */
 public final class LocalPathfinder {
 
@@ -47,8 +48,6 @@ public final class LocalPathfinder {
 
     /** 斜走成本（与启发一致）。 */
     private static final double SQRT2 = Math.sqrt(2.0);
-    /** 跳上 1 格成本。 */
-    private static final double STEP_UP_COST = 2.0;
     /** 下落基础成本 + 每额外高度增量。 */
     private static final double FALL_BASE = 1.0;
     private static final double FALL_EXTRA = 0.25;
@@ -104,6 +103,14 @@ public final class LocalPathfinder {
      *              {@link #AVOID_COST}——下一次重试真正「换一条路」而不是原路重算。null=不避让
      */
     public static LocalResult findPath(BlockPos start, BlockPos goal, Set<BlockPos> avoid) {
+        return findPath(start, goal, avoid, true);
+    }
+
+    /**
+     * @param allowMutation false 时仅生成纯移动路径，不允许 dig-through 或 place_step。
+     */
+    public static LocalResult findPath(BlockPos start, BlockPos goal, Set<BlockPos> avoid,
+            boolean allowMutation) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client == null || client.world == null) {
             return new LocalResult(Collections.emptyList(), Collections.emptyList(),
@@ -242,19 +249,6 @@ public final class LocalPathfinder {
                             new BlockPos(nx, cy, nz), moveCost + enterCost(bc, nx, cy, nz), null, null);
                 }
 
-                // 2) 上台阶 (+1 Y)：前方脚格为 1 格实心台 + 台上可站 + 当前列头顶可起跳
-                //    + 跳跃顶点不挡头。M11.5 修复：老代码此处第三个条件是
-                //    isPassable(nx, cy, nz)，与 hasGround(nx, cy, nz)（要求同格实心）恒矛盾
-                //    —— step_up 边从未生效，丘陵地形 A* 只能绕/挖/摔。起跳净空应查
-                //    **当前列** (cx, cy+2, cz)（原地起跳后前移）。
-                if (canStandAt(bc, nx, cy + 1, nz) && hasGround(bc, nx, cy, nz)
-                        && isPassable(bc, cx, cy + 2, cz)
-                        && isPassable(bc, nx, cy + 3, nz)) {  // 跳跃顶点 ~y+1.3 → 查 y+3
-                    relax(open, gScore, cameFrom, digOf, placeOf, closed, avoid, g, cur.pos, curG,
-                            new BlockPos(nx, cy + 1, nz),
-                            moveCost + STEP_UP_COST + enterCost(bc, nx, cy + 1, nz), null, null);
-                }
-
                 // 3) 下台阶 (-1 Y)：前方脚格空 + 下方可站
                 if (canStandAt(bc, nx, cy - 1, nz) && hasGround(bc, nx, cy - 2, nz)) {
                     relax(open, gScore, cameFrom, digOf, placeOf, closed, avoid, g, cur.pos, curG,
@@ -284,7 +278,8 @@ public final class LocalPathfinder {
                 //    只走直向（斜向挖穿会切角穿墙）。
                 //    M11：头格也实心时**两格都要进 digTargets**——老版本只记脚格，执行器挖穿
                 //    脚格后仍被头格挡住，白算了一条 2×digCost 的边（头格常是树叶/低檐）。
-                if (!diagonal && isDiggable(bc, nx, cy, nz) && hasGround(bc, nx, cy - 1, nz)) {
+                if (allowMutation && !diagonal && isDiggable(bc, nx, cy, nz)
+                        && hasGround(bc, nx, cy - 1, nz)) {
                     List<BlockPos> digs = new ArrayList<>(2);
                     digs.add(new BlockPos(nx, cy, nz));
                     double digCost = DIG_COST;
@@ -303,49 +298,13 @@ public final class LocalPathfinder {
                     }
                 }
 
-                // 6) dig_step_up（M11.5 难点③「阶梯式挖出通道」）：上台阶被台阶脚格/头格挡住
-                //    → 挖出楼梯位再跳上。台面 (nx, cy, nz) 必须实心（跳上去要站）；
-                //    台阶脚格 (nx, cy+1, nz) / 头格 (nx, cy+2, nz) 中实心者必须可挖；至少
-                //    挖一格（两格全空由 step_up 覆盖）。撞头跳顶点 1.2 > 1.0 足以登上
-                //    （§5.7 跳跃积分），故不要求 (nx, cy+3, nz) 通行。只走直向。
-                //    A* 连续串接此边即得「上行阶梯挖掘通道」——坑内无泥土时的脱困路径。
-                if (!diagonal && hasGround(bc, nx, cy, nz)
-                        && isPassable(bc, cx, cy + 2, cz)) {   // 当前列头顶可起跳
-                    boolean feetBlocked = !isPassable(bc, nx, cy + 1, nz);
-                    boolean headBlocked = !isPassable(bc, nx, cy + 2, nz);
-                    if (feetBlocked || headBlocked) {
-                        List<BlockPos> digs2 = new ArrayList<>(2);
-                        boolean ok = true;
-                        if (feetBlocked) {
-                            if (isDiggable(bc, nx, cy + 1, nz)) {
-                                digs2.add(new BlockPos(nx, cy + 1, nz));
-                            } else {
-                                ok = false;   // 基岩/危险格
-                            }
-                        }
-                        if (ok && headBlocked) {
-                            if (isDiggable(bc, nx, cy + 2, nz)) {
-                                digs2.add(new BlockPos(nx, cy + 2, nz));
-                            } else {
-                                ok = false;
-                            }
-                        }
-                        if (ok && !digs2.isEmpty()) {
-                            relax(open, gScore, cameFrom, digOf, placeOf, closed, avoid, g, cur.pos, curG,
-                                    new BlockPos(nx, cy + 1, nz),
-                                    moveCost + STEP_UP_COST + DIG_COST * digs2.size()
-                                            + enterCost(bc, nx, cy + 1, nz), digs2, null);
-                        }
-                    }
-                }
-
                 // 8) place_step（M11.5 难点③「用方块补足落脚点」）：前方身体两格可通行但
                 //    脚下缺失（空气/水）→ 放一块补上再走。两种可放置支撑（站定即可命中，
                 //    无需蹲边探身）：
                 //    - 1 格深坑：下方 (nx,cy-2) 实心 → 瞄其顶面，放置落在坑格；
                 //    - 1 格宽沟（任意深）：对侧同层 (nx+d,cy-1) 实心 → 瞄其朝沟侧面偏下点。
                 //    只走直向；成本 PLACE_COST（低于挖穿——放置快且不吃 dig_penalty）。
-                if (!diagonal && canStandAt(bc, nx, cy, nz)) {
+                if (allowMutation && !diagonal && canStandAt(bc, nx, cy, nz)) {
                     int footing = bc.stateAt(nx, cy - 1, nz);
                     if (footing == BlockCache.OPEN || footing == BlockCache.WATER) {
                         boolean belowSolid = hasGround(bc, nx, cy - 2, nz);

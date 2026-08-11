@@ -304,9 +304,11 @@ public final class VlaClient implements ClientModInitializer {
             }
 
             @Override
-            public void onGotoPath(List<int[]> waypoints, List<JsonObject> digTargets) {
-                LOGGER.info("[vla-client] WS goto_path wps={} dig={}", waypoints.size(),
-                        digTargets == null ? 0 : digTargets.size());
+            public void onGotoPath(List<int[]> waypoints, List<JsonObject> digTargets,
+                    boolean moveOnly) {
+                LOGGER.info("[vla-client] WS goto_path wps={} dig={} mode={}", waypoints.size(),
+                        digTargets == null ? 0 : digTargets.size(),
+                        moveOnly ? "move_only" : "default");
                 MinecraftClient client = MinecraftClient.getInstance();
                 if (client != null) {
                     client.execute(() -> {
@@ -327,7 +329,7 @@ public final class VlaClient implements ClientModInitializer {
                                 digs.add(new DigPlan(new BlockPos(x, y, z), block, tool));
                             }
                         }
-                        navExecutor.setPath(poses, digs);
+                        navExecutor.setPath(poses, digs, moveOnly);
                     });
                 }
             }
@@ -776,6 +778,10 @@ public final class VlaClient implements ClientModInitializer {
             j.addProperty("aimed_block_x", p.getX());
             j.addProperty("aimed_block_y", p.getY());
             j.addProperty("aimed_block_z", p.getZ());
+            if (client.player != null) {
+                j.addProperty("aimed_block_distance",
+                        client.player.getEyePos().distanceTo(bhr.getPos()));
+            }
         }
         // M11.5：准星瞄准实体（近战出剑门控——编排器只在准星实际套住目标实体时才
         // 挥击，否则乱挥剑/剑砍到猪身前的方块）

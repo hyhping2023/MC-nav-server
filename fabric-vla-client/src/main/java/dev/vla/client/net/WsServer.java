@@ -78,7 +78,8 @@ public class WsServer extends WebSocketServer {
          *  digTargets=计划要挖的方块（客户端只挖这些，杜绝乱挖掘）。每元素 JsonObject：
          *  {@code {x,y,z}} 或 {@code {x,y,z,block:"minecraft:stone",tool:"diamond_pickaxe"}}
          *  ——block/tool 由规划器标注，客户端据此切工具（老格式无 tool → 客户端按方块自动判断）。 */
-        default void onGotoPath(List<int[]> waypoints, List<JsonObject> digTargets) {
+        default void onGotoPath(List<int[]> waypoints, List<JsonObject> digTargets,
+                boolean moveOnly) {
         }
 
         /** M9.3：取消本地导航。 */
@@ -330,11 +331,14 @@ public class WsServer extends WebSocketServer {
                         }
                     }
                 }
-                handler.onGotoPath(wps, digs);
+                boolean moveOnly = obj.has("mode")
+                        && "move_only".equalsIgnoreCase(obj.get("mode").getAsString());
+                handler.onGotoPath(wps, digs, moveOnly);
                 JsonObject ok = new JsonObject();
                 ok.addProperty("type", "goto_ok");
                 ok.addProperty("waypoints", wps.size());
                 ok.addProperty("dig", digs.size());
+                ok.addProperty("mode", moveOnly ? "move_only" : "default");
                 conn.send(GSON.toJson(ok));
             }
             case "goto_cancel" -> {

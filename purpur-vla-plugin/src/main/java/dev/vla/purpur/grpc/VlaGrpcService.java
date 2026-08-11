@@ -7,6 +7,8 @@ import dev.vla.purpur.reset.ResetEngine;
 import dev.vla.purpur.task.TaskManager;
 import dev.vla.purpur.task.TaskRegistry;
 import dev.vla.purpur.task.TaskSpec;
+import dev.vla.purpur.world.ControlledPlainsGenerator;
+import dev.vla.purpur.world.SurfaceWorldManager;
 import dev.vla.purpur.world.VoxelReader;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -33,6 +35,8 @@ import vla.Vla.PingRequest;
 import vla.Vla.ResetReply;
 import vla.Vla.ResetRequest;
 import vla.Vla.SetBlockRequest;
+import vla.Vla.SelectSurfaceWorldReply;
+import vla.Vla.SelectSurfaceWorldRequest;
 import vla.Vla.ShowPathRequest;
 import vla.Vla.SpawnRequest;
 import vla.Vla.StateReply;
@@ -178,7 +182,14 @@ public class VlaGrpcService extends VlaServerGrpc.VlaServerImplBase {
                             .asRuntimeException());
                     return;
                 }
-                TaskSpec spec = plugin.getTaskManager().setTask(player, request.getTask());
+                if (!plugin.isWorldReady()) {
+                    responseObserver.onError(Status.UNAVAILABLE
+                            .withDescription("controlled plains initialization is still running")
+                            .asRuntimeException());
+                    return;
+                }
+                TaskSpec spec = plugin.getTaskManager().setTask(player, request.getTask(),
+                        request.getSeed());
                 if (spec == null) {
                     responseObserver.onError(Status.NOT_FOUND
                             .withDescription("unknown task: " + request.getTask())
@@ -191,6 +202,51 @@ public class VlaGrpcService extends VlaServerGrpc.VlaServerImplBase {
                 plugin.getLogger().warning("SetTask failed: " + e);
                 responseObserver.onError(Status.INTERNAL
                         .withDescription("setTask failed: " + e.getMessage())
+                        .withCause(e)
+                        .asRuntimeException());
+            }
+        });
+    }
+
+    @Override
+    public void selectSurfaceWorld(SelectSurfaceWorldRequest request,
+            StreamObserver<SelectSurfaceWorldReply> responseObserver) {
+        MainThreadDispatcher.runSync(() -> {
+            try {
+                Player player = plugin.getAgentManager().resolve(request.getPlayer());
+                if (player == null) {
+                    responseObserver.onError(Status.FAILED_PRECONDITION
+                            .withDescription("player not found: " + request.getPlayer())
+                            .asRuntimeException());
+                    return;
+                }
+                SurfaceWorldManager.Selection selected = plugin.selectSurfaceWorld(player,
+                        request.getSurface(), request.getSeed());
+                // 每个材质世界独立维护 ResetEngine 基线。让接下来的 ResetWorld 以新出生点为
+                // 中心，而非继续使用旧世界/旧材质的 session 区域。
+                plugin.getAgentManager().recordSessionRegion(player, selected.world().getSpawnLocation(),
+                        player.getLocation().getBlockX(), player.getLocation().getBlockY(),
+                        player.getLocation().getBlockZ(), 16);
+                responseObserver.onNext(SelectSurfaceWorldReply.newBuilder()
+                        .setWorldName(selected.world().getName())
+                        .setSurfaceId(selected.surfaceId())
+                        .setSurfaceMaterial(selected.material().getKey().toString())
+                        .setCreated(selected.created())
+                        .setWorkerId(selected.workerId())
+                        .setMapSeed(selected.world().getSeed())
+                        .setMetadataPath(selected.metadataPath().toString())
+                        .setSurfaceY(ControlledPlainsGenerator.SURFACE_Y)
+                        .build());
+                responseObserver.onCompleted();
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                responseObserver.onError(Status.INVALID_ARGUMENT
+                        .withDescription(e.getMessage())
+                        .withCause(e)
+                        .asRuntimeException());
+            } catch (Exception e) {
+                plugin.getLogger().warning("SelectSurfaceWorld failed: " + e);
+                responseObserver.onError(Status.INTERNAL
+                        .withDescription("selectSurfaceWorld failed: " + e.getMessage())
                         .withCause(e)
                         .asRuntimeException());
             }

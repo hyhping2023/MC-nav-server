@@ -29,6 +29,7 @@ service VlaServer {
   rpc GetVoxels(VoxelRequest) returns (VoxelReply);       // 32³ 体素
   rpc ComputePath(PathRequest) returns (PathReply);       // 航点
   rpc SetTask(TaskRequest) returns (TaskReply);
+  rpc SelectSurfaceWorld(SelectSurfaceWorldRequest) returns (SelectSurfaceWorldReply);
   rpc GenerateTask(GenerateRequest) returns (TaskReply);  // 课程/LLM 生成
   rpc ClearRegion(ClearRequest) returns (Void);
   rpc Teleport(TeleportRequest) returns (Void);
@@ -53,6 +54,7 @@ message StepReply {
 | `GetVoxels` | 32³ 局部体素矩阵 | VoxelReader |
 | `ComputePath` | A* 寻路输出航点 | AStar |
 | `SetTask` | 下发任务 | TaskManager |
+| `SelectSurfaceWorld` | 选择/创建 player 专属单材质元世界；并发 worker 不共享 world | SurfaceWorldManager |
 | `GenerateTask` | 课程/LLM 生成任务 | TaskManager / Curriculum |
 | `ClearRegion` / `Teleport` / `SpawnEntity` / `SetBlock` | God Mode 世界控制 | ResetEngine |
 

@@ -4,7 +4,8 @@
 调用 `vla.proto` 定义的 `VlaServer` 服务：
 
     Ping / ResetWorld / GetStepResult / GetState / GetVoxels / ComputePath /
-    SetTask / GenerateTask / ClearRegion / Teleport / SpawnEntity / SetBlock
+    SetTask / GenerateTask / ClearRegion / Teleport / SpawnEntity / SetBlock /
+    ShowPath / SelectSurfaceWorld
 
 关键约定（§4.2）：服务端写操作一律主线程执行；reward/done 以服务端为权威
 （§14.2），`GetStepResult` 阻塞等待 k ticks 结算。
@@ -147,6 +148,35 @@ class ServerGrpc:
             "progress": reply.progress,
             "success": reply.success,
             "timeout_ticks": reply.timeout_ticks,
+        }
+
+    def select_surface_world(
+        self,
+        surface: str,
+        player: Optional[str] = None,
+        seed: int = 0,
+    ) -> Dict[str, Any]:
+        """选择/创建一个单材质元世界，并传送玩家到该世界的 Y=64 平面出生点。
+
+        每种 surface 对应一个独立保存的 Minecraft 世界目录和元数据文件；重复选择同一
+        材质会复用已有世界存档。可选值：grass_block、dirt、coarse_dirt、sand、
+        red_sand、stone、granite、diorite、andesite、clay。
+        """
+        req = vla_pb2.SelectSurfaceWorldRequest(
+            player=player or self.player,
+            surface=str(surface),
+            seed=int(seed),
+        )
+        reply: vla_pb2.SelectSurfaceWorldReply = self.stub.SelectSurfaceWorld(req)
+        return {
+            "world_name": reply.world_name,
+            "surface_id": reply.surface_id,
+            "surface_material": reply.surface_material,
+            "created": reply.created,
+            "metadata_path": reply.metadata_path,
+            "surface_y": reply.surface_y,
+            "worker_id": reply.worker_id,
+            "map_seed": reply.map_seed,
         }
 
     def get_step_result(
