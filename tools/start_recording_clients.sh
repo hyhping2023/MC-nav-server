@@ -68,6 +68,7 @@ if ! [[ "$BASE_WS_PORT" =~ ^[0-9]+$ ]]; then
 fi
 
 mkdir -p "$RUNTIME_ROOT"
+RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" && pwd)"
 
 for ((offset = 0; offset < COUNT; offset++)); do
   index=$((START_INDEX + offset))
