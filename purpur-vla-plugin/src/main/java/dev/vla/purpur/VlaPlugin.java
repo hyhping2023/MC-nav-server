@@ -112,6 +112,9 @@ public class VlaPlugin extends JavaPlugin implements Listener {
         this.taskManager = new TaskManager(this);
         this.pathVisualizer = new PathVisualizer(this);
         this.surfaceWorldManager = new SurfaceWorldManager(this);
+        saveDefaultConfig();
+        getLogger().info("path visualizer enabled="
+                + getConfig().getBoolean("path-visualizer.enabled", false));
         Bukkit.getPluginManager().registerEvents(agentManager, this);
         // M5：任务相关事件（方块破坏/放置、实体死亡、玩家移动 → TaskManager 判定）
         Bukkit.getPluginManager().registerEvents(this, this);

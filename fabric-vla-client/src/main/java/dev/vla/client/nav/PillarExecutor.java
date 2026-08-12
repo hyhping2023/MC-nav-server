@@ -147,6 +147,10 @@ public final class PillarExecutor {
     private boolean pulsed;
     /** 正在挖的头顶块。 */
     private BlockPos digTarget;
+    /** 本轮空中 canPlaceAt 最后失败原因（VERIFY 失败时带出诊断）。 */
+    private String lastAirFail;
+    /** 本轮空中实际达到的 Δy（判断跳不起来/撞头）。 */
+    private double lastDy;
 
     public PillarExecutor(Consumer<StatusEvent> statusListener) {
         this.statusListener = statusListener;
@@ -172,6 +176,8 @@ public final class PillarExecutor {
         this.expectBlock = null;
         this.digTarget = null;
         this.pulsed = false;
+        this.lastAirFail = null;
+        this.lastDy = 0.0;
     }
 
     public synchronized void cancel() {
@@ -213,7 +219,7 @@ public final class PillarExecutor {
             case CLEAR_HEAD -> tickClearHead(player, feetY);
             case EQUIP -> tickEquip(player);
             case SETTLE -> tickSettle(player, feetY);
-            case JUMP -> tickJump();
+            case JUMP -> tickJump(player);
             case AIRBORNE -> tickAirborne(player);
             case VERIFY -> tickVerify(player, feetY);
         };
@@ -252,6 +258,7 @@ public final class PillarExecutor {
         if (!head.equals(digTarget)) {
             digTarget = head;
             phaseTicks = 0;
+            System.out.println("[pillar] dig head=" + head + " feetY=" + feetY);
         }
         if (phaseTicks > DIG_TIMEOUT) {
             return fail(player, R_DIG_TIMEOUT, "dig gave up at " + head);
@@ -312,10 +319,18 @@ public final class PillarExecutor {
             return fail(player, R_UNEVEN_GROUND,
                     "standing on a partial block (y=" + player.getY() + ", feetY=" + feetY + ")");
         }
-        // 目标格提前查一次：被半砖/花草之外的不可替换方块占住时立刻放弃，不白跳
+        // 目标格提前查一次：被半砖/花草之外的不可替换方块占住时立刻放弃，不白跳。
+        // 例外：不可替换矮方块（橡树苗等 hardness=0）——砍树掉落物常落脚下，可站立但占
+        // 放置格；aimed 收敛后 crosshairTarget 即本格，attack 一拍即破，挖掉再垫。
         BlockPos target = new BlockPos(player.getBlockX(), feetY, player.getBlockZ());
         BlockState at = player.getWorld().getBlockState(target);
         if (!at.isAir() && !at.isReplaceable()) {
+            if (isDiggable(at) && at.getBlock().getHardness() == 0.0f) {
+                aimAt(player, target);
+                ActionCmd cmd = new ActionCmd();
+                cmd.attack = true;
+                return cmd;
+            }
             return fail(player, R_PLACE_FAILED, "feet cell occupied: " + blockName(at));
         }
         if (phaseTicks < SETTLE_TICKS) {
@@ -328,9 +343,21 @@ public final class PillarExecutor {
         return new ActionCmd();
     }
 
-    /** 相位 4：起跳（只脉冲一拍 jump；持续按住会落地即刻重跳，抢在 VERIFY 之前）。 */
-    private ActionCmd tickJump() {
-        toPhase(Phase.AIRBORNE);
+    /**
+     * 相位 4：起跳——**持续按住 jump 直到确认离地**（Δy≥0.15 或 vy&gt;0.1），确认后释放
+     * 并转 AIRBORNE。
+     *
+     * <p>不能只脉冲一拍：WS 线程的 Python 动作（每 2 tick 一次空动作）会随时覆盖
+     * {@code currentAction}，若落在本相位注入与下一 tick {@code KeyboardInput} 读取之间，
+     * 单拍 jump 被吞、玩家原地不动（实测 lastDy=0.000 连跳 5 次全失败）。持续电平
+     * 把成功窗口从 1 tick 拉长到「直到确认离地」，被吞下一 tick 即补按。
+     */
+    private ActionCmd tickJump(ClientPlayerEntity player) {
+        double dy = player.getY() - jumpBaseY;
+        if (dy >= 0.15 || player.getVelocity().y > 0.1) {
+            toPhase(Phase.AIRBORNE);
+            return new ActionCmd();   // 已离地：释放 jump（电平保持则空中无副作用）
+        }
         ActionCmd cmd = new ActionCmd();
         cmd.jump = true;
         return cmd;
@@ -346,9 +373,10 @@ public final class PillarExecutor {
     private ActionCmd tickAirborne(ClientPlayerEntity player) {
         double dy = player.getY() - jumpBaseY;
         double vy = player.getVelocity().y;
+        lastDy = dy;
 
         if (!pulsed && dy >= PLACE_MIN_DY && vy <= PLACE_MAX_VY) {
-            BlockPos target = new BlockPos(player.getBlockX(), cycleFeetY, player.getBlockZ());
+            BlockPos target = resolveTarget(player, cycleFeetY);
             if (canPlaceAt(player, target)) {
                 expectBlock = target;
                 pulsed = true;
@@ -356,6 +384,18 @@ public final class PillarExecutor {
                 cmd.use = true;   // 下一 tick handleInputEvents 消费，玩家仍在顶点
                 return cmd;
             }
+            BlockState at = player.getWorld().getBlockState(target);
+            BlockState below = player.getWorld().getBlockState(target.down());
+            lastAirFail = "target=" + target + " " + blockName(at)
+                    + " below=" + blockName(below)
+                    + " minY=" + String.format(java.util.Locale.ROOT, "%.3f",
+                            player.getBoundingBox().minY)
+                    + " needY=" + (target.getY() + 1.0);
+        }
+        // 跳不起来（跳跃输入被落地吞掉 / 头顶被压）：回 SETTLE 重跳，不消耗 attempts
+        if (phaseTicks > 8 && dy < 0.3) {
+            toPhase(Phase.SETTLE);
+            return new ActionCmd();
         }
         // isOnGround 至少等 2 拍再认：起跳指令在下一 tick 的 tickEntities 才生效，
         // 第 1 拍读到的仍可能是 onGround=true，立刻转 VERIFY 会白扣一次 attempt。
@@ -380,7 +420,10 @@ public final class PillarExecutor {
         if (++attempts > MAX_ATTEMPTS) {
             return fail(player, R_PLACE_FAILED,
                     "failed " + attempts + " times at y=" + cycleFeetY
-                            + " (blockThere=" + blockThere + " feetY=" + feetY + ")");
+                            + " (blockThere=" + blockThere + " feetY=" + feetY
+                            + " pulsed=" + pulsed + " expect=" + expectBlock
+                            + " lastDy=" + String.format(java.util.Locale.ROOT, "%.3f", lastDy)
+                            + " airFail=" + lastAirFail + ")");
         }
         expectBlock = null;
         toPhase(Phase.CLEAR_HEAD);
@@ -428,6 +471,23 @@ public final class PillarExecutor {
             return false;   // 下方无面可点：正下射线会穿过去，落点不是这一格
         }
         return player.getBoundingBox().minY >= pos.getY() + 1.0;
+    }
+
+    /**
+     * 解析本轮放置格：玩家中心下方悬空（站在垫块边缘、中心格偏移）时，把目标格降到
+     * 正下射线命中实心格的上方——先在脚边补一块，下一轮起跳格下方就实心了。
+     */
+    private BlockPos resolveTarget(ClientPlayerEntity player, int feetY) {
+        BlockPos target = new BlockPos(player.getBlockX(), feetY, player.getBlockZ());
+        if (!isPassable(player.getWorld().getBlockState(target.down()))) {
+            return target;
+        }
+        BlockPos probe = target;
+        for (int i = 0; i < 2 && probe.getY() > 0
+                && isPassable(player.getWorld().getBlockState(probe)); i++) {
+            probe = probe.down();
+        }
+        return probe.up();
     }
 
     /** 主手可否放置（BlockItem 且非空）。 */

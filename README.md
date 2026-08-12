@@ -240,6 +240,27 @@ echo "vla status" > /tmp/vla_server_console
 服务端重启后，建议同时重启 Fabric 客户端和 Python worker。当前 autojoin 只在客户端
 启动时执行一次，不保证服务端重启后客户端自动重新入服。
 
+### 4.4 寻路调试粒子特效（path-visualizer）
+
+插件在任务执行时会向世界刷入调试粒子，用于直观展示导航和任务目标：
+
+- 服务端长程航点 = 黄色 Dust；
+- 客户端局部路径 = 白色 Dust；
+- 任务目标（含 `place_dirt` 选定放置位置、挖矿目标块等）= 红色 Dust 高亮柱
+  + END_ROD 闪光（"红色闪光点"），由编排器 `_highlight(cell)` 自动下发，每轮目标
+  重选后刷新，30 秒超时自动消失。
+
+粒子由服务端刷进世界、会进入录制画面。插件默认关闭，采集数据时保持关闭；调试导航
+行为或需要录制中可见目标标注时，编辑 `server/plugins/vla-purpur/config.yml`：
+
+```yaml
+path-visualizer:
+  enabled: true    # false=关闭（默认），true=开启
+```
+
+修改后重启服务端生效。插件默认配置模板位于
+`purpur-vla-plugin/src/main/resources/config.yml`。
+
 ---
 
 ## 5. 单客户端和单条 Demo

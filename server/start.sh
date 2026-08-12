@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # JDK 21（Purpur 1.20.1 需要 Java 17+）
-export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home}"
+export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
 JAVA="$JAVA_HOME/bin/java"
 if [ ! -x "$JAVA" ]; then
   echo "[start.sh] ERROR: java not found at $JAVA" >&2

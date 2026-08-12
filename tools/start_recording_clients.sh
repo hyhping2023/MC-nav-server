@@ -95,12 +95,36 @@ for ((offset = 0; offset < COUNT; offset++)); do
   echo "[start_recording_clients] starting $worker_id player=$player ws=$ws_port runDir=$run_dir"
   (
     cd "$CLIENT_DIR"
+    # Loom 按项目目录解析 -PvlaRunDir：绝对路径会被拼接错位，必须传相对路径
+    rel_run_dir=$(realpath --relative-to="$CLIENT_DIR" "$run_dir")
     exec ./gradlew --no-daemon runClient \
-      "-PvlaRunDir=$run_dir" \
+      "-PvlaRunDir=$rel_run_dir" \
       "-PvlaWsPort=$ws_port" \
       "-PvlaClientXmx=$CLIENT_XMX"
   ) >"$log_file" 2>&1 &
-  echo $! > "$pid_file"
+  client_pid=$!
+  echo "$client_pid" > "$pid_file"
+
+  # 同一项目目录并发 gradle 构建会损坏 loom 缓存，必须等本客户端真正进入
+  # 运行态（WS 监听）后才启动下一个。
+  ready=""
+  for _ in $(seq 1 90); do
+    if grep -q "WS server listening" "$log_file" 2>/dev/null; then
+      ready=yes
+      break
+    fi
+    # gradle 活着 = 构建未失败；客户端 java 未出现是正常阶段，不能算失败
+    if ! kill -0 "$client_pid" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+  if [[ -n "$ready" ]]; then
+    echo "[start_recording_clients] $worker_id ready (ws=$ws_port)"
+  else
+    echo "[start_recording_clients] ERROR: $worker_id did not become ready; aborting to protect loom cache" >&2
+    exit 1
+  fi
 done
 
 echo "[start_recording_clients] started $COUNT client(s); logs under $RUNTIME_ROOT"

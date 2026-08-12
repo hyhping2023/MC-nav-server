@@ -98,6 +98,11 @@ public final class PathVisualizer {
 
     /** 周期刷新：黄色=服务器航点，白色=客户端局部路径，目标红=高亮。 */
     private void refresh() {
+        // 采集数据时关闭粒子（config.yml path-visualizer.enabled=false），
+        // 避免调试特效进入录制画面。
+        if (!plugin.getConfig().getBoolean("path-visualizer.enabled", false)) {
+            return;
+        }
         if (serverPaths.isEmpty() && clientPaths.isEmpty()) return;
         long now = Bukkit.getCurrentTick();
         refreshMap(serverPaths, now, YELLOW_DUST, true);

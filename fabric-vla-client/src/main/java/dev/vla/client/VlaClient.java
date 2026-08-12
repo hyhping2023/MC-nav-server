@@ -204,8 +204,8 @@ public final class VlaClient implements ClientModInitializer {
             if (event.status() != PillarExecutor.Status.PROGRESS) {
                 currentAction.set(new ActionCmd());   // 结束即释放按键
             }
-            LOGGER.info("[vla-client] pillar_status {} placed={} feetY={} reason={}",
-                    event.status(), event.placed(), event.feetY(), event.reason());
+            LOGGER.info("[vla-client] pillar_status {} placed={} feetY={} reason={} detail={}",
+                    event.status(), event.placed(), event.feetY(), event.reason(), event.detail());
         });
 
         // M7.2：启动即应用 API 模式 UI（不抓鼠标、失焦不弹菜单）——CLIENT_STARTED 在

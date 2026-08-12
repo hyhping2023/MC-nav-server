@@ -70,7 +70,7 @@ public final class ObjectPlacer {
         clearPreviousTaskTarget(player);
         List<org.bukkit.block.Block> targetBlocks = new ArrayList<>();
         switch (target) {
-            case TREE -> placeTree(world, pos[0], pos[1], 3 + rng.nextInt(5), targetBlocks);
+            case TREE -> placeTree(world, pos[0], pos[1], 5 + rng.nextInt(3), targetBlocks);
             case STONE -> placeFourBlockShape(world, pos[0], pos[1], Material.STONE, rng, targetBlocks);
             case DIRT -> placeFourBlockShape(world, pos[0], pos[1], Material.DIRT, rng, targetBlocks);
         }

@@ -27,6 +27,9 @@ __pycache__/
 # CodeBuddy 会话内临时文件（scheduled_tasks 锁等）
 /.codebuddy/
 
+# OpenCode 会话工作文件
+/.omo/
+
 # demo 视频等生成产物（磁盘保留不入库）
 /datasets/
 

@@ -107,6 +107,10 @@ class KitAgent:
         # 正常导航/瞄准仍由执行策略负责。
         self._introduced_targets: Set[Tuple[int, int, int]] = set()
         self._last_arrived_stand: Optional[Tuple[int, int, int]] = None
+        # 无目标分支的连续垫高次数：体素扫描是全向的（half_extent 固定），垫高不扩大
+        # 扫描范围，树不在视野内时应游走换位置——连续垫高只消耗 dirt（实测用光 64 个
+        # → 客户端 out_of_blocks）。上限 2 次后强制转游走。
+        self._rescan_pillars = 0
 
     # ---- 顶层 ----
 
@@ -142,9 +146,16 @@ class KitAgent:
                 self._blacklist.clear()
                 self.log(f"  [dig] 无目标，清空黑名单重试（第 {self._blacklist_resets} 轮）")
                 return
-            self.log("  [dig] 视野内无目标 → pillar 垫高重扫")
-            if not self._pillar(max_blocks=4):
-                self._wander()
+            self.log("  [dig] 视野内无目标 → 游走重扫")
+            self._rescan_pillars += 1
+            if self._rescan_pillars >= 3:
+                self._rescan_pillars = 0
+                self._blacklist.clear()
+                self._blacklist_resets = 0
+                self.log("  [dig] 游走后仍无目标 → 全清黑名单兜底")
+            if self._rescan_pillars % 5 == 0:
+                self._debug_scan_targets()
+            self._wander()
             return
 
         # 阶段 1：在当前高度寻找“最近落脚点 + 可批量挖的目标集合”。
@@ -190,6 +201,8 @@ class KitAgent:
         target = self._choose_pillar_target(remaining)
         if target is None:
             return
+        self.log("  [dig] pillar_up 前 targets=" +
+                 str([(int(b[0]), int(b[1]), int(b[2])) for b in remaining]))
         base = self._pillar_base_for_target(target)
         if base is None:
             self.log(f"  [dig] 找不到高处目标 {target} 的垫高底座 → 黑名单")
@@ -444,12 +457,16 @@ class KitAgent:
                 if e.get("type") == "pillar_status":
                     state = str(e.get("state"))
                     if state in ("done", "arrived"):
+                        self.log(f"  [pillar] 成功（{state}）"
+                                 f"起点=({self._pos()[0]:.1f},{self._pos()[1]:.1f},"
+                                 f"{self._pos()[2]:.1f})")
                         return True
                     if state != "progress":
                         self.log(f"  [pillar] 终态 {state}"
-                                 f"（reason={e.get('reason')}）")
+                                 f"（reason={e.get('reason')} detail={e.get('detail')}）")
                         return False
         self.api.ws.send_pillar_cancel()
+        self.log("  [pillar] 预算超时无终态事件 → cancel")
         return False
 
     def _dig_at(self, target: Tuple[int, int, int],
@@ -475,7 +492,12 @@ class KitAgent:
         self.api.ws.send({"cmd": "look_at", "x": cx, "y": cy, "z": cz})
         self._semantic("dig_aim", target=list(target), block=block_name, slot=slot,
                        stand=list(stand))
-        self._pump(2)   # 瞄准收敛（12°/tick × 2 step = 48°，常规角度足够）
+        # 瞄准收敛：12°/tick 固定 2 step 只够 ~48°。pillar 结束后 pitch 残留在正下
+        # （+90），目标在头顶上方时需转 >135°——改为轮询准星命中，最多 10 step。
+        for _ in range(10):
+            if self._aimed_block_is(target):
+                break
+            self._pump(1)
         if not self._aimed_block_is(target):
             self._semantic("dig_gate_reject", target=list(target), reason="crosshair_or_range")
             return False
@@ -494,15 +516,24 @@ class KitAgent:
         return self.progress >= 1.0 or self._name_at(target) in (None, "minecraft:air")
 
     def _wander(self, budget: Optional[int] = None) -> None:
-        """随机方向短距游走（换视野/换角度）。"""
+        """随机方向短距游走（换视野/换角度）；失败（stuck/blocked）换方向重试。
+
+        距离 8-12 格：半扫描范围 16 格，游走 8-12 格后重扫中心平移，覆盖半径扩到
+        24-28 格——目标树在 16 格外时只有游走能扫到（实测 4-8 格游走找不到
+        collect_wood 剩余树，死循环到 max_steps）。
+        """
         st = self._state()
         px, py, pz = (float(v) for v in st["player"]["pos"])
-        ang = self.rng.uniform(0, 2 * math.pi)
-        d = self.rng.uniform(4, 8)
-        goal = [int(px + math.cos(ang) * d), int(py), int(pz + math.sin(ang) * d)]
-        self._semantic("wander", goal=goal)
-        self._goto(goal, [], budget=budget or self.WANDER_BUDGET, arrive_dist=1.5,
-                   stop_near=goal)
+        for attempt in range(3):
+            ang = self.rng.uniform(0, 2 * math.pi)
+            d = self.rng.uniform(8, 12)
+            goal = [int(px + math.cos(ang) * d), int(py), int(pz + math.sin(ang) * d)]
+            self._semantic("wander", goal=goal)
+            status = self._goto(goal, [], budget=budget or self.WANDER_BUDGET,
+                                arrive_dist=1.5, stop_near=goal)
+            if status in ("arrived", "reach"):
+                return
+            self.log(f"  [dig] 游走失败（{status}）→ 换方向（第 {attempt + 1} 次）")
 
     # ---- 目标选择 / 计划 ----
 
@@ -558,6 +589,45 @@ class KitAgent:
                         continue   # 高差过大（树冠/深层）
                     out.append(b)
         return out
+
+    def _debug_scan_targets(self) -> None:
+        """诊断：无目标持续时打印扫描范围内全部目标块及其排除原因。
+
+        与 {@code _remaining_targets} 同口径扫描但保留被排除项，用于定位"树到底在
+        哪/被什么排除"（黑名单、受保护地面、脚下、|dy|>6 高差）。
+        """
+        st = self._state()
+        px, py, pz = (float(v) for v in st["player"]["pos"])
+        palette, data, origin, size = self.api.grpc.get_voxels(
+            player=self.api.player, half_extent=self.half_extent)
+        idx_of = {b: i for i, b in enumerate(palette)}
+        wanted = set()
+        for b in self.profile.target_blocks:
+            for pal_name, i in idx_of.items():
+                if pal_name.split("[")[0] == b:
+                    wanted.add(i)
+        ox, oy, oz = origin
+        found = 0
+        for iy in range(size):
+            for iz in range(size):
+                for ix in range(size):
+                    if int(data[iy, iz, ix]) not in wanted:
+                        continue
+                    found += 1
+                    b = (ox + ix, oy + iy, oz + iz)
+                    reasons = []
+                    if b in self._blacklist:
+                        reasons.append("blacklist")
+                    if self.protected_ground_y is not None and b[1] <= self.protected_ground_y:
+                        reasons.append("protected")
+                    if b[0] == int(px) and b[2] == int(pz) and b[1] == int(py) - 1:
+                        reasons.append("underfeet")
+                    if abs(b[1] - py) > 6:
+                        reasons.append("dy=%d" % (b[1] - int(py)))
+                    self.log(f"  [dig] 扫描目标 {b} 排除={'、'.join(reasons) or '无'}")
+        if not found:
+            self.log(f"  [dig] 扫描范围内无任何目标块"
+                     f"（player=({int(px)},{int(py)},{int(pz)}) size={size}）")
 
     def _select_place_spot(self) -> Optional[Tuple[int, int, int]]:
         """place 目标格选择（M11.6）：体素扫描找"较远"的可放置地面格。
@@ -734,7 +804,29 @@ class KitAgent:
     def _pillar_base_for_target(
         self, target: Tuple[int, int, int]
     ) -> Optional[Tuple[int, int, int]]:
-        return self._approach_point(target)
+        """垫高底座：头顶 fy+2 不是任务目标块的旁侧地面脚位。
+
+        客户端 pillar 会挖掉头顶 fy+2——若该格是任务目标块（树干 log），垫高把
+        任务目标挖掉且掉落物不捡，任务永远差一块（实测 collect_wood 卡 0.75、
+        树根 2×2 时仅排除正下方列不够）。排除条件直接用目标块类型判断，
+        树根投影多大都安全。
+        """
+        stands = self._ground_stands_for_target(target)
+        if not stands:
+            return None
+
+        def head_clear(stand: Tuple[int, int, int]) -> bool:
+            above = self._name_at((stand[0], stand[1] + 1, stand[2]))
+            # None（体素查询失败/超时）→ 保守排除：宁可多走 1 格，不冒挖任务目标块
+            return above is not None and above not in self.profile.target_blocks
+
+        side = [s for s in stands if head_clear(s)]
+        if not side:
+            side = stands   # 全在目标块下方（树密/窄地）：退化保留原行为
+        return min(side, key=lambda stand: (
+            self._dist3(self._center(stand), self._center(target)),
+            self._dist3(self._pos(), self._center(stand)),
+            stand))
 
     def _aimed_block_is(self, target: Tuple[int, int, int]) -> bool:
         """客户端准星/交互距离门控，失败时绝不发 attack。"""
